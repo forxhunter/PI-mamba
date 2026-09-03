@@ -1,0 +1,10 @@
+torch==2.1.0
+einops==0.7.0
+numpy==1.26.2
+tqdm==4.66.2
+biopython==1.83
+mamba-ssm>=1.1.1
+scipy>=1.10.0
+pandas>=2.1.0
+matplotlib>=3.8.0
+hydra-core>=1.3.0
