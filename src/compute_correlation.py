@@ -28,17 +28,27 @@ def load_sweep_results(input_dir: str) -> pd.DataFrame:
             with open(json_file) as f:
                 data = json.load(f)
             
-            # Extract relevant metrics
+            # Only per-run summaries written by scripts/train.py are used
+            if not isinstance(data, dict) or "final_val_loss" not in data:
+                continue
+
+            def metric(*keys):
+                # A metric that was not measured is NaN, never 0
+                for key in keys:
+                    if data.get(key) is not None:
+                        return float(data[key])
+                return float("nan")
+
             record = {
-                "file": os.path.basename(json_file),
+                "file": os.path.relpath(json_file, input_dir),
                 "model": data.get("model", "unknown"),
-                "seed": data.get("seed", 0),
-                "lr": data.get("lr", 0),
-                "batch_size": data.get("batch_size", 0),
-                "C_10": data.get("final_C_10", data.get("C_10", 0)),
-                "scTM": data.get("final_scTM", data.get("scTM", 0)),
-                "val_loss": data.get("final_val_loss", data.get("val_loss", 0)),
-                "grad_norm": data.get("final_grad_norm", data.get("grad_norm", 0)),
+                "seed": data.get("seed"),
+                "lr": data.get("lr"),
+                "batch_size": data.get("batch_size"),
+                "C_10": metric("final_C_10", "C_10"),
+                "scTM": metric("final_scTM", "scTM"),
+                "val_loss": metric("final_val_loss", "val_loss"),
+                "grad_norm": metric("final_grad_norm", "grad_norm"),
             }
             records.append(record)
         except Exception as e:
@@ -111,6 +121,9 @@ def generate_correlation_figure(df: pd.DataFrame, output_path: str):
         mask = ~(df[pred].isna() | df["scTM"].isna())
         x = df.loc[mask, pred].values
         y = df.loc[mask, "scTM"].values
+        if len(x) < 5:
+            ax.set_title(f"{label}: fewer than 5 runs")
+            continue
         
         ax.scatter(x, y, alpha=0.6, s=50)
         
@@ -153,8 +166,12 @@ def main():
     
     # Compute correlations
     print("\n=== Predictor Correlations ===")
+    if df["scTM"].isna().all():
+        print("No run has a measured scTM. Run the sweep with --proteinmpnn_dir "
+              "(or scripts/evaluate.py --mode eval) to measure it; "
+              "correlations with scTM are skipped.")
     corr_df = compute_predictor_correlations(df)
-    print(corr_df.to_string(index=False))
+    print(corr_df.to_string(index=False) if len(corr_df) else "(no predictor has 5 or more runs with scTM)")
     
     # Save table
     table_path = os.path.join(args.output, "correlation_table.csv")
@@ -162,8 +179,9 @@ def main():
     print(f"\nSaved: {table_path}")
     
     # Generate figure
-    fig_path = os.path.join(args.output, "correlation_plot.png")
-    generate_correlation_figure(df, fig_path)
+    if len(corr_df):
+        fig_path = os.path.join(args.output, "correlation_plot.png")
+        generate_correlation_figure(df, fig_path)
     
     # Architecture comparison (P3)
     if "model" in df.columns and df["model"].nunique() > 1:

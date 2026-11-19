@@ -1,0 +1,42 @@
+# Single-GPU training configuration for scripts/train.py.
+
+# Data
+data_dir: Distilled_trainset   # relative paths are resolved from the repository root
+min_len: 20
+max_len: 512
+max_bond: 4.8            # drop chains with a CA-CA distance above this (chain break)
+val_fraction: 0.05
+
+# Optimisation
+epochs: 200
+max_steps: null          # stop after this many steps if set
+batch_size: 32
+max_residues: 4800       # cap on batch_size * length; long chains get smaller batches
+lr: 3.0e-4
+lr_min: 1.0e-6
+warmup_steps: 1000
+weight_decay: 0.01
+grad_clip: 1.0
+ema_decay: 0.999
+seed: 0
+
+# Loss weights. Distances are measured in model units (Angstrom / coord_scale).
+lambda_fape: 1.0         # local pairwise distance loss (window of 8 residues)
+lambda_bond: 1.0         # CA-CA bond length loss (3.8 Angstrom)
+lambda_dist: 0.5         # long-range distance matrix loss
+lambda_rg: 0.0           # radius-of-gyration prior
+lambda_hbond: 0.0        # secondary-structure prior
+lambda_rama: 0.0         # pseudo-dihedral prior
+lambda_omega: 0.0        # cis/trans head (labels from CA-CA distance)
+lambda_torsion: 0.0      # torsion head; needs N and C atoms in the PDB files
+aux_t_min: 0.5           # auxiliary losses use samples with t >= aux_t_min
+
+# Logging, validation and checkpoints
+checkpoint_dir: checkpoints
+log_every: 50
+val_every: 1000
+val_batches: 40
+sample_lengths: [100, 200]
+n_val_samples: 16
+sample_steps: 100
+log_ck: false            # log the Rouse mode concentration C_10 at validation

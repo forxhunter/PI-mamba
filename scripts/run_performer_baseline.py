@@ -7,8 +7,11 @@ Compares PI-Mamba and Performer backbones on:
 2. Memory usage vs sequence length
 3. Scaling exponent fitting
 
+This is a cost benchmark. It uses untrained models, because runtime and memory
+do not depend on the weights.
+
 Usage:
-    python run_performer_baseline.py --output results/performer_benchmark.csv
+    python scripts/run_performer_baseline.py --output performer_benchmark.csv
 """
 
 import argparse
@@ -20,11 +23,15 @@ import sys
 import torch
 import numpy as np
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from backbone_pi_mamba import PIMambaBackbone
-from backbone_performer import PerformerBackbone
+from src.backbone_pi_mamba import PIMambaBackbone
+from src.backbone_performer import PerformerBackbone
+
+
+def synchronize(device):
+    if torch.device(device).type == 'cuda':
+        torch.cuda.synchronize()
 
 
 def measure_runtime(model, length, n_samples=10, n_steps=50, device='cuda', warmup=2):
@@ -36,18 +43,18 @@ def measure_runtime(model, length, n_samples=10, n_steps=50, device='cuda', warm
         with torch.no_grad():
             _ = model.sample(length=length, n_samples=1, n_steps=n_steps, device=device)
     
-    torch.cuda.synchronize()
+    synchronize(device)
     
     # Measure
     times = []
     for _ in range(n_samples):
-        torch.cuda.synchronize()
+        synchronize(device)
         start = time.perf_counter()
         
         with torch.no_grad():
             _ = model.sample(length=length, n_samples=1, n_steps=n_steps, device=device)
         
-        torch.cuda.synchronize()
+        synchronize(device)
         end = time.perf_counter()
         times.append(end - start)
     
@@ -55,7 +62,9 @@ def measure_runtime(model, length, n_samples=10, n_steps=50, device='cuda', warm
 
 
 def measure_memory(model, length, n_steps=50, device='cuda'):
-    """Measure peak GPU memory usage."""
+    """Measure peak GPU memory usage in GB (nan on CPU)."""
+    if torch.device(device).type != 'cuda':
+        return float('nan')
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     

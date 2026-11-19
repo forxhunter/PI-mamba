@@ -33,8 +33,8 @@ References:
 import math
 import torch
 import torch.nn as nn
+from collections import OrderedDict
 from typing import Tuple, Optional
-from functools import lru_cache
 
 
 def compute_rouse_eigenvalues(N: int, device: torch.device = None) -> torch.Tensor:
@@ -163,79 +163,143 @@ def compute_state_transition_matrix(N: int, dt: float,
     return A
 
 
+# Shared cache of DCT-II bases, keyed by (length, device, dtype). Every layer of a
+# model asks for the same basis, so one copy per sequence length is enough.
+_BASIS_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+_BASIS_CACHE_SIZE = 16
+
+SPECTRUM_CHOICES = ("rouse", "scrambled", "interpolated")
+
+
+def get_rouse_basis(L: int, device: torch.device = None,
+                    dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Return the orthonormal Rouse (DCT-II) basis for a chain of exactly L beads."""
+    # torch.empty resolves None / "cuda" / "cuda:0" to one canonical device
+    device = torch.empty(0, device=device).device
+    key = (L, str(device), dtype)
+    V = _BASIS_CACHE.get(key)
+    if V is None:
+        V = compute_rouse_eigenvectors(L, device=device, normalize=True).to(dtype)
+        _BASIS_CACHE[key] = V
+        while len(_BASIS_CACHE) > _BASIS_CACHE_SIZE:
+            _BASIS_CACHE.popitem(last=False)
+    else:
+        _BASIS_CACHE.move_to_end(key)
+    return V
+
+
 class RouseTransform(nn.Module):
     """
-    Efficient Rouse mode transform using precomputed DCT basis.
-    
-    Transforms between real space (residue positions) and mode space
-    (Rouse normal modes). This is equivalent to a Type-II DCT.
-    
-    For sequences longer than max_length, we use a chunked approach
-    or recompute the basis on-the-fly.
+    Rouse mode transform (orthonormal Type-II DCT along the chain).
+
+    The basis and the eigenvalues depend on the chain length, so both are built
+    for the actual length L of the input. Slicing the first L rows and columns
+    out of a longer basis does not give the basis of a length-L chain.
+
+    The transform is a dense (L, L) matmul, which costs O(L^2) per feature
+    channel. It is cheap on a GPU for the lengths used here (L <= a few
+    thousand).
+
+    The module also assigns decay rates to the SSM state channels
+    (``get_state_rates``). Reordering the rates among the state channels does
+    not change the model class: the kernel sum_n C_n B_n exp(-rate_n * dt) is
+    symmetric under a permutation of n, and B and C are learned. A control
+    therefore has to change the set of rates, and two such controls exist.
+
+    Args:
+        max_length: Kept for backward compatibility. It no longer limits the
+            sequence length.
+        spectrum: How state channels get their rates.
+            ``rouse``: the d_state slowest Rouse modes, 4 sin^2(p pi / 2L) for
+            p = 0 .. d_state - 1.
+            ``scrambled``: d_state modes drawn at random from the whole Rouse
+            spectrum instead of its slow end. Channel n always takes the mode
+            at the same relative position q_n in (0, 1) of the spectrum, so
+            its rate 4 sin^2(q_n pi / 2) does not depend on L. This control
+            removes the selection of slow modes; the rates are larger than
+            the Rouse ones on long chains.
+            ``interpolated``: alpha * rouse + (1 - alpha) * r, where r is a
+            fixed random vector scaled to the range of the Rouse rates at the
+            same length. This control keeps the range of time scales and
+            removes the sin^2 spacing.
+        alpha: Mixing weight for ``interpolated`` (1 = pure Rouse).
+        seed: Seed for the fixed random draw of ``scrambled`` / ``interpolated``.
+            The draw does not depend on the chain length.
     """
-    
-    def __init__(self, max_length: int = 2048):
+
+    def __init__(self, max_length: int = 2048, spectrum: str = "rouse",
+                 alpha: float = 1.0, seed: int = 42):
         super().__init__()
+        if spectrum not in SPECTRUM_CHOICES:
+            raise ValueError(f"spectrum must be one of {SPECTRUM_CHOICES}, got {spectrum!r}")
         self.max_length = max_length
-        
-        # Precompute basis for common lengths
-        V = compute_rouse_eigenvectors(max_length, normalize=True)
-        self.register_buffer('V', V)  # (max_length, max_length)
-        
-        # Precompute eigenvalues
-        eigenvalues = compute_rouse_eigenvalues(max_length)
-        self.register_buffer('eigenvalues', eigenvalues)  # (max_length,)
-        
+        self.spectrum = spectrum
+        self.alpha = alpha
+        self.seed = seed
+        # Empty buffer that only tracks the module's device and dtype.
+        self.register_buffer("_ref", torch.zeros(0), persistent=False)
+
     def forward_transform(self, x: torch.Tensor) -> torch.Tensor:
         """
         Transform from real space to mode space.
-        
+
         Args:
             x: (B, L, D) tensor in real space
-            
+
         Returns:
-            x_mode: (B, L, D) tensor in mode space
+            x_mode: (B, L, D) tensor in mode space, x_mode = V^T x
         """
-        B, L, D = x.shape
-        
-        if L <= self.max_length:
-            V = self.V[:L, :L]  # (L, L)
-        else:
-            V = compute_rouse_eigenvectors(L, device=x.device, normalize=True)
-        
-        # x_mode = V^T @ x (for each feature dimension)
-        x_mode = torch.einsum('mn, bnd -> bmd', V.T, x)
-        
-        return x_mode
-    
+        V = get_rouse_basis(x.shape[1], x.device, x.dtype)
+        return torch.einsum('nm, bnd -> bmd', V, x)
+
     def inverse_transform(self, x_mode: torch.Tensor) -> torch.Tensor:
         """
         Transform from mode space to real space.
-        
+
         Args:
             x_mode: (B, L, D) tensor in mode space
-            
+
         Returns:
-            x: (B, L, D) tensor in real space
+            x: (B, L, D) tensor in real space, x = V x_mode
         """
-        B, L, D = x_mode.shape
-        
-        if L <= self.max_length:
-            V = self.V[:L, :L]  # (L, L)
-        else:
-            V = compute_rouse_eigenvectors(L, device=x_mode.device, normalize=True)
-        
-        # x = V @ x_mode
-        x = torch.einsum('nm, bmd -> bnd', V, x_mode)
-        
-        return x
-    
+        V = get_rouse_basis(x_mode.shape[1], x_mode.device, x_mode.dtype)
+        return torch.einsum('nm, bmd -> bnd', V, x_mode)
+
     def get_eigenvalues(self, L: int) -> torch.Tensor:
-        """Get Rouse eigenvalues for length L."""
-        if L <= self.max_length:
-            return self.eigenvalues[:L]
-        else:
-            return compute_rouse_eigenvalues(L, device=self.eigenvalues.device)
+        """Rouse eigenvalues (L,) for a chain of L beads."""
+        return compute_rouse_eigenvalues(L, device=self._ref.device)
+
+    def _fixed_uniform(self, d_state: int) -> torch.Tensor:
+        """Fixed uniform(0, 1) draw of size d_state that depends on the seed only."""
+        gen = torch.Generator().manual_seed(self.seed)
+        return torch.rand(d_state, generator=gen).to(self._ref.device)
+
+    def get_state_rates(self, L: int, d_state: int) -> torch.Tensor:
+        """
+        Decay rates (d_state,) for the SSM state channels on a chain of L beads.
+
+        See the class docstring for the three spectra. For ``rouse`` and
+        ``interpolated`` with d_state > L the spectrum is tiled.
+
+        Note on long chains: the Rouse rates of the d_state slowest modes are
+        4 sin^2(p pi / 2L) for p < d_state, so they shrink as 1/L^2. With
+        d_state = 64 the largest rate is 1.95 at L = 128 but only 0.15 at
+        L = 512, i.e. every state channel becomes a near-integrator and the
+        spread of time scales within a layer narrows. The input-dependent tau
+        has to supply the remaining dynamic range.
+        """
+        if self.spectrum == "scrambled":
+            q = self._fixed_uniform(d_state)
+            return 4.0 * torch.sin(0.5 * math.pi * q) ** 2
+
+        eig = self.get_eigenvalues(L)
+        if d_state > L:
+            eig = eig.repeat(d_state // L + 1)
+        rates = eig[:d_state]
+        if self.spectrum == "rouse":
+            return rates
+        random_rates = self._fixed_uniform(d_state) * rates.max()
+        return self.alpha * rates + (1.0 - self.alpha) * random_rates
 
 
 class ZimmCorrection(nn.Module):
@@ -417,7 +481,7 @@ if __name__ == "__main__":
     print(f"Orthonormality error: {off_diag.abs().max().item():.6f}")
     
     # Test transform
-    transform = RouseTransform(max_length=1024).to(device)
+    transform = RouseTransform().to(device)
     x = torch.randn(2, N, 64, device=device)
     x_mode = transform.forward_transform(x)
     x_recon = transform.inverse_transform(x_mode)

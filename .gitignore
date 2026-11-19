@@ -22,3 +22,9 @@ wandb/
 Thumbs.db
 .idea/
 .vscode/
+
+# Experiment output
+sweep_results/
+counterfactual_results/
+figures/
+*.log

@@ -4,44 +4,41 @@ Rouse Mode Concentration Measurement (Theory Contract Object).
 
 Computes C_k: fraction of Mamba hidden-state variance captured by the first k Rouse modes.
 
-Usage:
-    python measure_mode_concentration.py --checkpoint path/to/ckpt.pt --output metrics.json
+Usage (from the repository root):
+    python -m src.measure_mode_concentration --demo
+    python -m src.measure_mode_concentration --checkpoint path/to/ckpt.pt \
+        --data_dir Distilled_trainset --output metrics.json
 """
 
-import torch
-import numpy as np
 import argparse
 import json
-from pathlib import Path
 
-# Import from v12 package
-from rouse_physics import RouseTransform, compute_rouse_eigenvectors
+import torch
+
+from .rouse_physics import compute_rouse_eigenvectors
 
 
 def compute_mode_concentration(
     hidden_states: torch.Tensor,
     k: int = 10,
-    rouse_transform: RouseTransform = None,
 ) -> dict:
     """
     Compute Rouse Mode Concentration C_k.
     
     Args:
         hidden_states: (B, L, D) Mamba hidden states from a batch.
-        k: Number of top modes to consider.
-        rouse_transform: Precomputed RouseTransform object.
+        k: Number of lowest Rouse modes to consider.
         
     Returns:
         dict with:
-            - C_k: Fraction of variance in top-k modes.
-            - eigenvalues: Top-k eigenvalues of projected covariance.
-            - total_variance: Tr(Sigma_h).
+            - C_k: Fraction of variance in the k lowest modes. A signal with
+              no structure along the chain gives about k / L.
+            - total_variance: Sum of the per-mode variances.
+            - mode_variances / cumulative_explained: per-mode values for the
+              k lowest modes.
     """
     B, L, D = hidden_states.shape
     device = hidden_states.device
-    
-    if rouse_transform is None:
-        rouse_transform = RouseTransform(max_length=L)
     
     # Get Rouse eigenvectors V: (L, L)
     V = compute_rouse_eigenvectors(L, device=device, normalize=True)
@@ -79,117 +76,57 @@ def compute_mode_concentration(
 
 def measure_from_checkpoint(
     checkpoint_path: str,
-    model_class: str = "PIMambaBackbone",
-    data_loader = None,
+    data_dir: str,
     k: int = 10,
     n_batches: int = 10,
+    batch_size: int = 16,
 ) -> dict:
     """
-    Load a model checkpoint and measure C_k on validation data.
+    Load a model checkpoint and measure C_k on real structures.
+
+    The encoder output of the last layer is taken on clean structures (t = 1).
 
     Args:
-        checkpoint_path: Path to .pt checkpoint.
-        model_class: Name of model class to instantiate.
-        data_loader: DataLoader for validation data.
-        k: Number of top modes.
+        checkpoint_path: Path to a checkpoint written by scripts/train.py.
+        data_dir: Directory with .pdb files.
+        k: Number of lowest modes.
         n_batches: Number of batches to average over.
+        batch_size: Chains per batch (all chains in a batch have one length).
 
     Returns:
         Aggregated metrics dict.
     """
-    import torch
-    from pathlib import Path
-    import sys
+    from torch.utils.data import DataLoader
 
-    # Add src to path
-    sys.path.append(str(Path(__file__).parent))
+    from .data import CADataset, LengthBatchSampler, collate_same_length
+    from .model_io import load_checkpoint
 
-    # Import model
-    if model_class == "PIMambaBackbone":
-        from backbone_pi_mamba import PIMambaBackbone as ModelClass
-    else:
-        raise ValueError(f"Unknown model class: {model_class}")
-
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-
-    # Initialize model
-    model = ModelClass(
-        d_model=checkpoint.get('d_model', 256),
-        n_layers=checkpoint.get('n_layers', 12),
-        d_state=checkpoint.get('d_state', 64),
-    )
-
-    # Load weights
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-
-    model.eval()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
+    model, ckpt = load_checkpoint(checkpoint_path, device=device)
+    scale = ckpt["config"].get("coord_scale", 10.0)
 
-    # If no dataloader provided, create a simple one
-    if data_loader is None:
-        print("Warning: No dataloader provided. Using random data for demonstration.")
-        # Create dummy data
-        class DummyDataset(torch.utils.data.Dataset):
-            def __len__(self):
-                return n_batches * 8
-            def __getitem__(self, idx):
-                return torch.randn(100, 3)
+    dataset = CADataset(data_dir)
+    sampler = LengthBatchSampler(dataset.lengths, batch_size, shuffle=True, seed=0)
+    loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=collate_same_length)
 
-        data_loader = torch.utils.data.DataLoader(
-            DummyDataset(),
-            batch_size=8,
-            shuffle=False
-        )
-
-    # Collect hidden states
     all_results = []
-
     with torch.no_grad():
-        for batch_idx, batch in enumerate(data_loader):
+        for batch_idx, batch in enumerate(loader):
             if batch_idx >= n_batches:
                 break
+            coords = batch["ca"].to(device) / scale
+            t = torch.ones(coords.shape[0], device=device)
+            h = model.hidden_states(coords, t)
+            all_results.append(compute_mode_concentration(h, k=k))
 
-            # Get batch data
-            if isinstance(batch, (list, tuple)):
-                coords = batch[0].to(device)
-            else:
-                coords = batch.to(device)
-
-            B, L, _ = coords.shape
-
-            # Forward pass to get hidden states
-            # We need to access intermediate hidden states from Mamba layers
-            # For now, we'll use the final hidden state as a proxy
-            t = torch.zeros(B, device=device)
-            t_emb = model.time_embed(t)
-
-            h = model.input_proj(coords)
-            h = h + model.pos_encoding[:, :L, :]
-
-            # Pass through PI-Mamba layers and collect hidden states
-            for mamba_layer, adaptive_norm in zip(model.pi_mamba_layers, model.adaptive_norms):
-                h = adaptive_norm(h, t_emb)
-                h, _ = mamba_layer(h, return_physics=False)
-
-            # Compute mode concentration on hidden states
-            result = compute_mode_concentration(h, k=k)
-            all_results.append(result)
-
-    # Aggregate results
-    aggregated = {
-        'C_k': sum(r['C_k'] for r in all_results) / len(all_results),
+    n = len(all_results)
+    return {
+        'C_k': sum(r['C_k'] for r in all_results) / n,
         'k': k,
-        'total_variance': sum(r['total_variance'] for r in all_results) / len(all_results),
-        'top_k_variance': sum(r['top_k_variance'] for r in all_results) / len(all_results),
-        'n_batches': len(all_results),
+        'total_variance': sum(r['total_variance'] for r in all_results) / n,
+        'top_k_variance': sum(r['top_k_variance'] for r in all_results) / n,
+        'n_batches': n,
     }
-
-    return aggregated
 
 
 def demo():
@@ -229,6 +166,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--demo", action="store_true", help="Run demo")
     parser.add_argument("--checkpoint", type=str, help="Path to checkpoint")
+    parser.add_argument("--data_dir", type=str, help="Directory with .pdb files")
     parser.add_argument("--output", type=str, default="mode_concentration.json")
     parser.add_argument("--k", type=int, default=10, help="Number of top modes")
     args = parser.parse_args()
@@ -236,7 +174,9 @@ if __name__ == "__main__":
     if args.demo:
         demo()
     elif args.checkpoint:
-        result = measure_from_checkpoint(args.checkpoint, k=args.k)
+        if not args.data_dir:
+            parser.error("--data_dir is required with --checkpoint")
+        result = measure_from_checkpoint(args.checkpoint, args.data_dir, k=args.k)
         with open(args.output, 'w') as f:
             json.dump(result, f, indent=2)
         print(f"Saved to {args.output}")

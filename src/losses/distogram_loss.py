@@ -12,10 +12,10 @@ import torch.nn.functional as F
 
 class DistogramLoss(nn.Module):
     """
-    Match predicted pairwise CA distance matrix to target distogram.
+    Match predicted pairwise CA distance matrix to the target distance matrix.
 
-    Uses smooth L1 loss on pairwise distances, with optional binning
-    for numerical stability. Subsamples pairs for efficiency.
+    Uses smooth L1 loss on pairwise distances (clamped at max_dist) for pairs
+    more than 3 residues apart. Subsamples pairs for efficiency.
     """
 
     def __init__(self, max_dist: float = 40.0, n_subsample: int = 512):
@@ -63,7 +63,7 @@ class DistogramLoss(nn.Module):
             flat_pred = pred_dist.view(B, -1)
             flat_target = target_dist.view(B, -1)
 
-            loss = 0.0
+            loss = pred.new_zeros(())
             count = 0
             for b in range(B):
                 valid_idx = flat_mask[b].nonzero(as_tuple=True)[0]
@@ -101,7 +101,7 @@ class RadiusOfGyrationLoss(nn.Module):
             loss: scalar
         """
         B = pred.shape[0]
-        loss = 0.0
+        loss = pred.new_zeros(())
 
         for b in range(B):
             m = mask[b].bool()

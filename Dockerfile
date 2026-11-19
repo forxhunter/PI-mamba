@@ -23,5 +23,6 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy the entire codebase
 COPY . /workspace
 
-# Set the entrypoint
+# Set the entrypoint, e.g.
+#   docker run --gpus all <image> scripts/train.py --max_steps 1000
 ENTRYPOINT ["python3"]

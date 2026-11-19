@@ -32,9 +32,9 @@ class LocalDistanceLoss(nn.Module):
         Returns:
             loss: scalar
         """
-        loss = 0.0
-        count = 0.0
-        for offset in range(1, self.window + 1):
+        loss = pred.new_zeros(())
+        count = pred.new_zeros(())
+        for offset in range(1, min(self.window, pred.shape[1] - 1) + 1):
             pred_dist = torch.norm(pred[:, offset:] - pred[:, :-offset], dim=-1)
             target_dist = torch.norm(target[:, offset:] - target[:, :-offset], dim=-1)
             m = mask[:, offset:] * mask[:, :-offset]

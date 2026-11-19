@@ -1,12 +1,13 @@
 """
-Hydrogen Bond Auxiliary Loss for Secondary Structure Formation
+Secondary-Structure Prior Loss (hydrogen-bond geometry proxy)
 
 This module implements an auxiliary loss that encourages the formation of
-canonical secondary structure elements (α-helices and β-sheets) by penalizing
-configurations that lack proper hydrogen bonding geometry.
+canonical secondary structure elements (alpha-helices and beta-sheets). With CA
+coordinates only, hydrogen bonds cannot be evaluated directly, so the loss
+uses the CA-CA distances that the hydrogen-bond patterns imply.
 
-The H-bond loss is crucial for improving scTM from 0.85 → 0.91 by encouraging
-the model to form designable secondary structures rather than just compact folds.
+The loss is a prior, not a data term: it asks for a minimum amount of helix-
+and sheet-like geometry in every structure. It is off by default in train.py.
 """
 
 import torch
@@ -23,7 +24,9 @@ class HydrogenBondLoss(nn.Module):
     - α-helix patterns: H-bonds between residue i and i+4
     - β-sheet patterns: H-bonds between distant residues with parallel/antiparallel geometry
     
-    The loss is computed from CA coordinates by approximating backbone N-H and C=O positions.
+    The loss is computed from CA-CA distances. Satisfaction of a distance
+    criterion is measured with a sigmoid of width ``temperature`` so that the
+    loss has a gradient.
     """
     
     def __init__(
@@ -34,6 +37,7 @@ class HydrogenBondLoss(nn.Module):
         distance_tolerance: float = 0.5,  # Å
         helix_i_to_i4_dist: float = 6.2,  # Å (CA_i to CA_{i+4} in α-helix)
         helix_tolerance: float = 0.8,
+        temperature: float = 0.25,  # Å, softness of the satisfaction indicator
     ):
         super().__init__()
         self.helix_weight = helix_weight
@@ -42,6 +46,11 @@ class HydrogenBondLoss(nn.Module):
         self.distance_tolerance = distance_tolerance
         self.helix_i_to_i4_dist = helix_i_to_i4_dist
         self.helix_tolerance = helix_tolerance
+        self.temperature = temperature
+
+    def _satisfied(self, deviation: torch.Tensor, tolerance: float) -> torch.Tensor:
+        """Soft indicator in (0, 1) of deviation < tolerance."""
+        return torch.sigmoid((tolerance - deviation) / self.temperature)
     
     def compute_helix_loss(self, ca_coords: torch.Tensor) -> torch.Tensor:
         """
@@ -74,8 +83,8 @@ class HydrogenBondLoss(nn.Module):
         helix_3_deviation = torch.abs(i3_dists - 5.4)
         
         # Encourage at least 30% of residues to be in helix-like geometry
-        helix_4_satisfied = (helix_4_deviation < self.helix_tolerance).float()
-        helix_3_satisfied = (helix_3_deviation < self.helix_tolerance).float()
+        helix_4_satisfied = self._satisfied(helix_4_deviation, self.helix_tolerance)
+        helix_3_satisfied = self._satisfied(helix_3_deviation, self.helix_tolerance)
         
         # Combined helix satisfaction
         helix_frac = (helix_4_satisfied.mean() + helix_3_satisfied.mean()) / 2.0
@@ -120,13 +129,13 @@ class HydrogenBondLoss(nn.Module):
         # Sheet contacts: d ≈ 4.8 Å
         ideal_sheet_dist = 4.8
         sheet_deviation = torch.abs(dist_matrix - ideal_sheet_dist)
-        sheet_contacts = ((sheet_deviation < 1.0) * long_range_mask).sum(dim=(1, 2))
+        sheet_contacts = (self._satisfied(sheet_deviation, 1.0) * long_range_mask).sum(dim=(1, 2))
+
+        # Number of sheet contacts per residue (a residue in the middle of a
+        # sheet has two partners; each pair is counted twice in the sum)
+        sheet_contact_frac = sheet_contacts / (2.0 * L)
         
-        # Normalize by possible pairs
-        n_possible = (long_range_mask.sum() + 1e-8)
-        sheet_contact_frac = sheet_contacts / n_possible
-        
-        # Target: at least 5% sheet contacts
+        # Target: at least 5% of the residues paired with a strand partner
         target_sheet_frac = 0.05
         sheet_loss = F.relu(target_sheet_frac - sheet_contact_frac.mean())
         

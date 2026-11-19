@@ -9,21 +9,13 @@ Reference:
     Choromanski et al. (2021). Rethinking Attention with Performers. ICLR.
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict
 from einops import rearrange
 
-# Import shared components from PI-Mamba
-from backbone_pi_mamba import (
-    AdaptiveLayerNorm,
-    TimeEmbedding,
-    StructureModule,
-    OmegaHead,
-    NeRFProjection,
-)
+# Shared components from PI-Mamba
+from .backbone_pi_mamba import AdaptiveLayerNorm, FlowBackbone
 
 
 class LinearAttention(nn.Module):
@@ -127,15 +119,15 @@ class LinearAttentionBlock(nn.Module):
         return x
 
 
-class PerformerBackbone(nn.Module):
+class PerformerBackbone(FlowBackbone):
     """
     Performer-based backbone for protein structure generation.
-    
+
     Uses Linear Attention instead of Mamba for the sequence encoder.
-    All other components (Structure Module, Chain Retraction, OmegaHead)
-    are identical to PI-Mamba for fair comparison.
+    All other components (embeddings, output heads, sampler, bond projection)
+    are inherited from ``FlowBackbone`` and identical to PI-Mamba.
     """
-    
+
     def __init__(
         self,
         d_model: int = 256,
@@ -144,24 +136,17 @@ class PerformerBackbone(nn.Module):
         n_structure_layers: int = 4,
         max_length: int = 2048,
         dropout: float = 0.1,
+        coord_scale: float = 10.0,
     ):
-        super().__init__()
-        
-        self.d_model = d_model
-        self.n_layers = n_layers
-        
-        # Time embedding
-        self.time_embed = TimeEmbedding(d_model)
-        
-        # Input projection
-        self.input_proj = nn.Linear(3, d_model)
-        
-        # Position encoding
-        self.register_buffer(
-            'pos_encoding',
-            self._create_pos_encoding(max_length, d_model)
+        super().__init__(
+            d_model=d_model,
+            n_structure_layers=n_structure_layers,
+            max_length=max_length,
+            coord_scale=coord_scale,
         )
-        
+
+        self.n_layers = n_layers
+
         # Linear Attention layers (instead of PI-Mamba)
         self.attn_layers = nn.ModuleList([
             LinearAttentionBlock(
@@ -172,152 +157,18 @@ class PerformerBackbone(nn.Module):
             )
             for _ in range(n_layers)
         ])
-        
+
         # Adaptive layer norms (time-conditioned)
         self.adaptive_norms = nn.ModuleList([
             AdaptiveLayerNorm(d_model, d_cond=d_model)
             for _ in range(n_layers)
         ])
-        
-        # Structure module (same as PI-Mamba)
-        self.structure_module = StructureModule(
-            d_model=d_model,
-            n_layers=n_structure_layers,
-        )
-        
-        # Omega Prediction Head
-        self.omega_head = OmegaHead(d_model)
-        
-        # Chain retraction
-        self.kinematic_proj = NeRFProjection()
-        
-        # Output projection
-        self.output_proj = nn.Linear(d_model, 3)
-        
-    def _create_pos_encoding(self, max_length: int, d_model: int) -> torch.Tensor:
-        position = torch.arange(max_length).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        
-        pe = torch.zeros(max_length, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        return pe.unsqueeze(0)
-        
-    def forward(
-        self,
-        coords: torch.Tensor,
-        t: torch.Tensor,
-        return_physics: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Dict]]:
-        """
-        Forward pass: predict velocity field for flow matching.
-        """
-        B, L, _ = coords.shape
-        
-        # Time embedding
-        t_emb = self.time_embed(t)
-        
-        # Input projection
-        h = self.input_proj(coords)
-        
-        # Add position encoding
-        h = h + self.pos_encoding[:, :L, :]
-        
-        # Pass through Linear Attention layers
-        for i, (attn_layer, adaptive_norm) in enumerate(
-            zip(self.attn_layers, self.adaptive_norms)
-        ):
-            h = adaptive_norm(h, t_emb)
-            h = attn_layer(h)
-        
-        # Structure module
-        coords_pred = self.structure_module(h, t_emb)
-        
-        # Output projection
-        velocity = self.output_proj(h)
-        
-        # Omega logits
-        omega_logits = self.omega_head(h)
-        
-        if return_physics:
-            # Performer has no physics-informed parameters
-            return velocity, omega_logits, {'note': 'Performer baseline (no physics)'}
-        
-        return velocity, omega_logits
-        
-    def sample(
-        self,
-        length: int,
-        n_samples: int = 1,
-        n_steps: int = 100,
-        device: torch.device = None,
-    ) -> torch.Tensor:
-        """Generate protein backbones using flow matching."""
-        if device is None:
-            device = next(self.parameters()).device
-        
-        coords = torch.randn(n_samples, length, 3, device=device) * 0.1
-        timesteps = torch.linspace(1.0, 0.0, n_steps, device=device)
-        
-        with torch.no_grad():
-            for i in range(len(timesteps) - 1):
-                t = timesteps[i].unsqueeze(0).expand(n_samples)
-                dt = timesteps[i] - timesteps[i + 1]
-                
-                velocity, omega_logits = self.forward(coords, t)
-                
-                # Get target distances from omega predictions
-                cis_probs = F.softmax(omega_logits, dim=-1)[:, :, 1]
-                is_cis = cis_probs > 0.5
-                
-                target_dists = torch.ones(n_samples, length - 1, 1, device=device) * 3.8
-                cis_mask = is_cis[:, 1:]
-                target_dists[cis_mask] = 2.96
-                
-                coords = coords + velocity * dt
-                
-                # Chain retraction every 10 steps
-                if (i + 1) % 10 == 0:
-                    coords = self.kinematic_proj._project_bonds(coords, target_lengths=target_dists)
-        
-        coords = self.kinematic_proj._project_bonds(coords, target_lengths=target_dists)
-        
-        return coords
 
-
-if __name__ == "__main__":
-    print("Testing Performer Backbone")
-    print("=" * 50)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Create model
-    model = PerformerBackbone(
-        d_model=256,
-        n_layers=4,
-        n_heads=8,
-        n_structure_layers=2,
-    ).to(device)
-    
-    # Test forward
-    coords = torch.randn(2, 100, 3, device=device)
-    t = torch.rand(2, device=device)
-    
-    velocity, omega_logits, info = model(coords, t, return_physics=True)
-    
-    print(f"Input shape: {coords.shape}")
-    print(f"Output shape: {velocity.shape}")
-    print(f"Omega logits: {omega_logits.shape}")
-    print(f"Info: {info}")
-    
-    # Count parameters
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {n_params:,}")
-    
-    # Test sampling
-    print("\nTesting sampling...")
-    samples = model.sample(length=50, n_samples=2, n_steps=20, device=device)
-    print(f"Sample shape: {samples.shape}")
-    
-    print("\n✓ All tests passed!")
+    def encode(self, h, t_emb, return_physics: bool = False):
+        for attn_layer, adaptive_norm in zip(self.attn_layers, self.adaptive_norms):
+            # Same residual pattern as PI-Mamba: h <- h + f(AdaLN(h, t)). The
+            # attention block has its own internal skip, which is removed here.
+            h_norm = adaptive_norm(h, t_emb)
+            h = h + (attn_layer(h_norm) - h_norm)
+        # Performer has no physics-informed parameters
+        return h, ({'note': 'Performer baseline (no physics)'} if return_physics else None)

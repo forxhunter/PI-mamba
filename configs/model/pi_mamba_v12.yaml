@@ -1,0 +1,28 @@
+# PI-Mamba V12 model configuration (paper configuration: 16 layers, d_model 512).
+# Every key is a keyword argument of src.model_io.build_model.
+
+model: pi_mamba          # pi_mamba | performer | transformer
+
+d_model: 512             # hidden dimension
+n_layers: 16             # number of encoder layers
+d_state: 64              # SSM state channels (Rouse modes) per group
+d_conv: 4                # width of the causal convolution in each layer
+expand_factor: 2         # inner expansion of each layer
+n_groups: 8              # channel groups sharing one (tau, dt, B, C) set
+n_heads: 8               # attention heads (performer / transformer baselines)
+n_structure_layers: 4    # structure module layers (torsion head)
+max_length: 2048         # size of the position-encoding table
+dropout: 0.1
+
+# State transition
+use_physics: true        # true: A from the Rouse spectrum; false: free learned A
+spectrum: rouse          # rouse: the d_state slowest Rouse modes
+                         # scrambled: random modes from the whole Rouse spectrum
+                         # interpolated: alpha * rouse + (1 - alpha) * range-matched random rates
+spectrum_alpha: 1.0      # mixing weight of the interpolated spectrum
+spectrum_seed: 42
+
+# Numerics
+coord_scale: 10.0        # Angstrom per model unit
+scan_chunk: 32           # chunk length of the vectorised scan
+checkpoint_scan: true    # recompute the scan in backward to save memory

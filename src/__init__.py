@@ -7,11 +7,13 @@ is derived from the Rouse model of polymer dynamics.
 Key Components:
     - rouse_physics: Rouse eigenvalues, eigenvectors, and transforms
     - pi_mamba_layer: Physics-Informed Mamba layer
-    - backbone_pi_mamba: Full PI-Mamba backbone with SE(3) flow matching
+    - backbone_pi_mamba: PI-Mamba backbone trained with flow matching
+    - backbone_performer / backbone_transformer: baseline encoders
+    - data, metrics, geometry, losses: training and evaluation utilities
 
-The core insight is that Mamba's recurrence IS the polymer physics:
-    h_{t+1} = A h_t + B x_t
-    where A = exp(-λ_p * τ) and λ_p are Rouse eigenvalues
+The state transition of every layer is
+    h_t = A_t h_{t-1} + B_t x_t,   A_n = exp(-lambda_n * dt / tau),
+where lambda_n are Rouse eigenvalues and tau, dt are input-dependent.
 
 References:
     [1] Rouse, P.E. (1953). J. Chem. Phys. 21, 1272.
@@ -37,19 +39,26 @@ from .pi_mamba_layer import (
 )
 
 from .backbone_pi_mamba import (
+    FlowBackbone,
     PIMambaBackbone,
     AdaptiveLayerNorm,
     TimeEmbedding,
     StructureModule,
-    NeRFProjection,
+    ChainProjection,
+    project_bonds,
+    relax_chain,
     validate_generated_structures,
 )
 
-__version__ = "12.0.0"
+from .backbone_performer import PerformerBackbone
+from .backbone_transformer import TransformerBackbone
+from .model_io import build_model, load_checkpoint, save_checkpoint, MODEL_CHOICES
+
+__version__ = "12.1.0"
 __all__ = [
     # Rouse physics
     "compute_rouse_eigenvalues",
-    "compute_rouse_eigenvectors", 
+    "compute_rouse_eigenvectors",
     "compute_rouse_relaxation_times",
     "compute_state_transition_matrix",
     "RouseTransform",
@@ -63,10 +72,20 @@ __all__ = [
     # PI-Mamba layer
     "PhysicsInformedMamba",
     "PhysicsInformedMambaBlock",
-    # Backbone
+    # Backbones
+    "FlowBackbone",
     "PIMambaBackbone",
+    "PerformerBackbone",
+    "TransformerBackbone",
     "AdaptiveLayerNorm",
     "TimeEmbedding",
     "StructureModule",
-    "NeRFProjection",
+    "ChainProjection",
+    "project_bonds",
+    "relax_chain",
+    # Model construction and checkpoints
+    "build_model",
+    "load_checkpoint",
+    "save_checkpoint",
+    "MODEL_CHOICES",
 ]

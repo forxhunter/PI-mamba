@@ -1,44 +1,33 @@
-"""In‑painting (motif‑scaffolding) utilities for PI‑Mamba.
+"""In-painting (motif-scaffolding) utilities for PI-Mamba.
 
-The core function `scaffold_motif` receives:
-  * `model` – a trained `PIMambaBackbone` instance.
-  * `motif_coords` – tensor of shape (B, M, 3) containing CA coordinates of the fixed motif.
-  * `motif_mask` – boolean tensor (B, L) where `True` indicates positions belonging to the motif.
-  * `length` – total sequence length L (>= M).
-  * `n_steps` – number of ODE integration steps.
+``scaffold_motif`` generates a chain of ``length`` residues that contains a
+given motif at given positions, with replacement guidance:
 
-The algorithm:
-  1. Initialise the full chain with Gaussian noise (CA only).
-  2. At each Euler step, predict the velocity with the model.
-  3. Zero‑out the velocity for motif positions (so they stay static).
-  4. Perform an Euler update on the whole chain.
-  5. Every `proj_every` steps (default 10) apply the kinematic projection to enforce geometry.
-  6. After the final step, re‑inject the exact motif coordinates to guarantee perfect alignment.
+  1. The motif is centred and placed in the model frame. The rest of the
+     chain starts from Gaussian noise.
+  2. At every Euler step of the flow (t from 0 to 1) the motif positions are
+     overwritten with the motif interpolated to the current time,
+     x_t = (1 - t) * noise + t * motif, so the network always sees the motif
+     at the noise level it expects.
+  3. Only the scaffold positions are integrated with the predicted velocity.
+  4. At the end the CA-CA bond projection is applied to the whole chain.
 
-The function returns the full scaffold (B, L, 3) and computes two RMSD metrics:
-  * `motif_rmsd` – RMSD between the generated and reference motif (should be ~0).
-  * `scaffold_rmsd` – RMSD of the non‑motif region against a reference scaffold if provided.
+The projection moves the motif slightly, so the motif is not re-inserted
+afterwards. ``motif_rmsd`` reports how far the motif in the final chain is
+from the reference motif after optimal superposition.
 
-This module is deliberately lightweight; it does **not** depend on external
-protein design libraries, making it easy to run in the CI environment.
+The motif is placed with its centroid at the origin, which is also the
+centroid of the generated chain. This simple placement suits motifs that sit
+in the core of the scaffold.
 """
 
 import torch
-import torch.nn.functional as F
+
+from .backbone_pi_mamba import project_bonds
+from .geometry import CA_CA_TRANS, kabsch_rmsd
 
 
-def rmsd(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Root‑mean‑square deviation between two sets of coordinates.
-
-    Both tensors must have shape (B, N, 3). The function aligns the centroids
-    before computing the Euclidean distance.
-    """
-    a_centered = a - a.mean(dim=1, keepdim=True)
-    b_centered = b - b.mean(dim=1, keepdim=True)
-    diff = a_centered - b_centered
-    return torch.sqrt((diff ** 2).sum(dim=[1, 2]) / a.shape[1])
-
-
+@torch.no_grad()
 def scaffold_motif(
     model,
     length: int,
@@ -46,62 +35,73 @@ def scaffold_motif(
     motif_mask: torch.Tensor,
     n_steps: int = 100,
     proj_every: int = 10,
-    device: torch.device = torch.device("cpu"),
+    final_projection: bool = True,
+    device: torch.device = None,
+    generator: torch.Generator = None,
 ) -> dict:
-    """Generate a scaffold around a fixed motif using PI‑Mamba.
+    """Generate a scaffold around a fixed motif using PI-Mamba.
 
     Args:
-        model: `PIMambaBackbone` (already on `device`).
+        model: trained ``FlowBackbone`` (for example ``PIMambaBackbone``).
         length: total sequence length L (>= motif length).
-        motif_coords: (B, M, 3) tensor of CA coordinates for the motif.
-        motif_mask: (B, L) boolean mask where `True` marks motif positions.
+        motif_coords: (B, M, 3) CA coordinates of the motif in Angstrom.
+        motif_mask: (B, L) boolean mask where ``True`` marks motif positions.
+            Every row must mark exactly M positions; the motif residues are
+            assigned to them in order.
         n_steps: number of Euler integration steps.
-        proj_every: frequency of kinematic projection.
-        device: torch device.
+        proj_every: bond projection every this many steps during the last 20%
+            of the trajectory (0 disables it).
+        final_projection: apply the bond projection to the finished chain. It
+            makes every CA-CA distance exactly 3.8 A but moves the motif, which
+            raises ``motif_rmsd``; set it to False to keep the motif exact and
+            accept approximate bond lengths.
+        device: torch device (default: the device of the model).
+        generator: optional random generator for the noise.
 
     Returns:
         dict with keys:
-            "scaffold": (B, L, 3) generated CA coordinates,
-            "motif_rmsd": scalar tensor,
-            "full_rmsd": optional scalar if a reference scaffold is supplied.
+            "scaffold": (B, L, 3) generated CA coordinates in Angstrom,
+            "motif_rmsd": (B,) RMSD in Angstrom between the motif positions of
+                the generated chain and the reference motif.
     """
     model.eval()
+    if device is None:
+        device = next(model.parameters()).device
     B, M, _ = motif_coords.shape
     L = length
-    # Initialise full chain with noise (small Gaussian perturbation)
-    scaffold = torch.randn(B, L, 3, device=device) * 0.1
-    # Insert the motif coordinates into the initial scaffold (helps convergence)
-    scaffold = scaffold.clone()
-    scaffold[motif_mask] = motif_coords.view(-1, 3)
+    motif_mask = motif_mask.to(device).bool()
+    if not (motif_mask.sum(dim=1) == M).all():
+        raise ValueError("every row of motif_mask must mark exactly M positions")
 
-    # Time schedule (reverse flow: from noise to data)
-    timesteps = torch.linspace(1.0, 0.0, n_steps, device=device)
-    with torch.no_grad():
-        for i in range(n_steps - 1):
-            t = timesteps[i].unsqueeze(0).expand(B)
-            dt = timesteps[i] - timesteps[i + 1]
-            # Predict velocity for the whole chain
-            velocity, _ = model(scaffold, t)
-            # Zero velocity on motif positions
-            velocity = velocity.clone()
-            velocity[motif_mask] = 0.0
-            # Euler update
-            scaffold = scaffold + velocity * dt
-            # Projection step
-            if (i + 1) % proj_every == 0 or i == n_steps - 2:
-                scaffold = model.kinematic_proj(scaffold)
-        # Final projection to guarantee geometry
-        scaffold = model.kinematic_proj(scaffold)
-        # Re‑inject exact motif coordinates (ensures perfect alignment)
-        scaffold[motif_mask] = motif_coords.view(-1, 3)
+    scale = model.coord_scale
+    bond = CA_CA_TRANS / scale
+    motif = motif_coords.to(device).float()
+    motif = (motif - motif.mean(dim=1, keepdim=True)) / scale  # model units, centred
 
-    # Compute RMSD for the motif (should be ~0)
+    noise = torch.randn(B, L, 3, device=device, generator=generator)
+    noise = noise - noise.mean(dim=1, keepdim=True)
+    motif_noise = noise[motif_mask].view(B, M, 3)
+
+    x = noise.clone()
+    timesteps = torch.linspace(0.0, 1.0, n_steps + 1, device=device)
+    for i in range(n_steps):
+        t_now, t_next = timesteps[i], timesteps[i + 1]
+        # The motif at the current noise level
+        x[motif_mask] = ((1.0 - t_now) * motif_noise + t_now * motif).reshape(-1, 3)
+
+        velocity = model(x, t_now.expand(B))[0]
+        x = x + velocity * (t_next - t_now)
+
+        if proj_every and i > n_steps * 0.8 and (i + 1) % proj_every == 0:
+            x = project_bonds(x, bond)
+
+    x[motif_mask] = motif.reshape(-1, 3)
+    if final_projection:
+        x = project_bonds(x, bond)
+
+    scaffold = x * scale
     motif_generated = scaffold[motif_mask].view(B, M, 3)
-    motif_rmsd_val = rmsd(motif_generated, motif_coords).mean()
-
     return {
         "scaffold": scaffold,
-        "motif_rmsd": motif_rmsd_val,
+        "motif_rmsd": kabsch_rmsd(motif_generated, motif * scale),
     }
-
-# End of inpainting.py

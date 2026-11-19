@@ -4,23 +4,30 @@ Validation Callback for Rouse Mode Concentration.
 
 Integrates with PyTorch training loop to log C_k metrics during validation.
 
+All hidden states accumulated between two resets must have the same sequence
+length, because the Rouse basis depends on it.
+
 Usage:
-    from validation_callback import ModeConcentrationCallback
+    from src.validation_callback import ModeConcentrationCallback, create_training_hook
     callback = ModeConcentrationCallback(k=10)
-    
-    # In validation loop:
+    handle = create_training_hook(model, callback)
+
+    # In validation loop (batches of one length):
     for batch in val_loader:
-        hidden_states = model.get_hidden_states(batch)
-        callback.accumulate(hidden_states)
-    
+        model(coords, t)          # the hook stores the encoder output
+
     metrics = callback.compute()
-    wandb.log(metrics)
+    handle.remove()
+
+scripts/train.py --log_ck logs the same quantity without the hook, through
+``model.hidden_states``.
 """
 
+from typing import Dict
+
 import torch
-import numpy as np
-from typing import Dict, Optional
-from measure_mode_concentration import compute_mode_concentration, compute_rouse_eigenvectors
+
+from .measure_mode_concentration import compute_mode_concentration
 
 
 class ModeConcentrationCallback:
@@ -77,64 +84,21 @@ class ModeConcentrationCallback:
 
 def create_training_hook(model, callback: ModeConcentrationCallback):
     """
-    Create a forward hook to capture hidden states during forward pass.
-    
+    Create a forward hook that captures the output of the last encoder layer.
+
     Args:
-        model: PI-Mamba model with a 'mamba_layers' attribute
+        model: a ``FlowBackbone`` (PI-Mamba, Performer or Transformer)
         callback: ModeConcentrationCallback instance
-        
+
     Returns:
-        hook_handle for removal
+        hook handle; call ``.remove()`` on it when done
     """
-    def hook_fn(module, input, output):
-        # Assuming output is (B, L, D) hidden states
-        if isinstance(output, torch.Tensor) and len(output.shape) == 3:
-            callback.accumulate(output)
-    
-    # Register on the last Mamba layer
-    if hasattr(model, 'mamba_layers'):
-        last_layer = model.mamba_layers[-1]
-        return last_layer.register_forward_hook(hook_fn)
-    else:
-        print("Warning: Could not find mamba_layers attribute")
-        return None
+    def hook_fn(module, inputs, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        if isinstance(hidden, torch.Tensor) and hidden.dim() == 3:
+            callback.accumulate(hidden)
 
-
-# Integration example for train.py
-INTEGRATION_TEMPLATE = '''
-# Add to train.py validation loop:
-
-from validation_callback import ModeConcentrationCallback
-
-# Initialize
-ck_callback = ModeConcentrationCallback(k=10)
-
-def validate(model, val_loader):
-    model.eval()
-    ck_callback.reset()
-    
-    with torch.no_grad():
-        for batch in val_loader:
-            # Forward pass
-            output = model(batch)
-            
-            # Get hidden states (model-specific)
-            hidden_states = model.last_hidden_state  # or similar accessor
-            ck_callback.accumulate(hidden_states)
-            
-            # ... compute scTM, loss, etc.
-    
-    # Log C_k
-    ck_metrics = ck_callback.compute()
-    wandb.log({
-        "val/C_10": ck_metrics["C_10"],
-        "val/scTM": mean_sctm,
-        "val/loss": mean_loss,
-    })
-    
-    return ck_metrics
-'''
-
-if __name__ == "__main__":
-    print("Integration template:")
-    print(INTEGRATION_TEMPLATE)
+    for name in ("pi_mamba_layers", "attn_layers"):
+        if hasattr(model, name):
+            return getattr(model, name)[-1].register_forward_hook(hook_fn)
+    raise AttributeError("model has neither pi_mamba_layers nor attn_layers")

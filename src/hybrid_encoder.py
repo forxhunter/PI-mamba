@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from pi_mamba_layer import PhysicsInformedMambaBlock
+from .pi_mamba_layer import PhysicsInformedMambaBlock
 
 
 class SparseAttentionBranch(nn.Module):
@@ -34,31 +34,17 @@ class SparseAttentionBranch(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, D = x.shape
-        # Pad for windowed attention
-        pad = self.window
-        x_padded = F.pad(x, (0, 0, pad, pad), mode="constant", value=0.0)
-        # Build queries, keys, values for each position using sliding windows
-        queries = []
-        keys = []
-        values = []
-        for i in range(L):
-            start = i
-            end = i + 2 * self.window + 1
-            window_slice = x_padded[:, start:end, :]
-            queries.append(x[:, i : i + 1, :])
-            keys.append(window_slice)
-            values.append(window_slice)
-        # Stack to shape (B, L, 1, D) -> (B*L, 1, D)
-        Q = torch.cat(queries, dim=1).view(B * L, 1, D)
-        K = torch.cat(keys, dim=1).view(B * L, 2 * self.window + 1, D)
-        V = torch.cat(values, dim=1).view(B * L, 2 * self.window + 1, D)
-        # Add positional bias
-        K = K + self.pos_bias.unsqueeze(0)
-        V = V + self.pos_bias.unsqueeze(0)
-        # Multihead attention (single query per position)
-        attn_out, _ = self.attn(Q, K, V)
-        attn_out = attn_out.view(B, L, D)
-        return attn_out
+        W = 2 * self.window + 1
+        # Sliding windows of keys/values around every position: (B, L, W, D)
+        x_padded = F.pad(x, (0, 0, self.window, self.window), mode="constant", value=0.0)
+        windows = x_padded.unfold(1, W, 1).permute(0, 1, 3, 2)
+        K = windows.reshape(B * L, W, D) + self.pos_bias.unsqueeze(0)
+        Q = x.reshape(B * L, 1, D)
+        # Window slots that fall outside the chain are masked out
+        idx = torch.arange(L, device=x.device).unsqueeze(1) + torch.arange(W, device=x.device) - self.window
+        pad_mask = ((idx < 0) | (idx >= L)).repeat(B, 1)  # (B*L, W)
+        attn_out, _ = self.attn(Q, K, K, key_padding_mask=pad_mask)
+        return attn_out.view(B, L, D)
 
 
 class GatedFusion(nn.Module):
@@ -81,9 +67,10 @@ class GatedFusion(nn.Module):
 class HybridEncoder(nn.Module):
     """Combine Physics‑Informed Mamba with sparse attention.
 
-    The module can be dropped into the existing `PIMambaBackbone` in place of the
-    original `self.pi_mamba_layers` list. It returns a single hidden representation
-    that can be fed to the structure module.
+    Optional encoder variant. It is not used by `PIMambaBackbone` or by the
+    training script. It maps embedded inputs (B, L, D) to hidden states
+    (B, L, D), the same contract as `FlowBackbone.encode` without the time
+    conditioning.
     """
 
     def __init__(
@@ -97,6 +84,7 @@ class HybridEncoder(nn.Module):
         dropout: float = 0.1,
         use_physics: bool = True,
         sparse_window: int = 32,
+        **layer_kwargs,
     ):
         super().__init__()
         self.n_layers = n_layers
@@ -111,6 +99,7 @@ class HybridEncoder(nn.Module):
                     n_groups=n_groups,
                     dropout=dropout,
                     use_physics=use_physics,
+                    **layer_kwargs,
                 )
                 for _ in range(n_layers)
             ]
@@ -119,7 +108,7 @@ class HybridEncoder(nn.Module):
         self.fusion = GatedFusion(d_model)
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
         # x: (B, L, D)
         h = x
         for layer in self.mamba_layers:

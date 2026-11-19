@@ -2,317 +2,190 @@
 """
 PI-Mamba Evaluation Script
 
-Generates samples, then runs ProteinMPNN + ESMFold + TMscore pipeline.
+Three steps, selected with --mode:
 
-Usage (two-step, different conda envs):
-  Step 1 - Generate samples (fm env):
-    CUDA_VISIBLE_DEVICES=1 conda run -n fm python evaluate.py --mode generate \
-        --checkpoint ../checkpoints_v13/best_model.pt --n_samples 100 --length 100
+  generate  Sample backbones from a checkpoint and write PDB files to
+            <eval_dir>/pdbs. --length takes one length or a comma-separated
+            list, and generates --n_samples backbones for each.
+  metrics   CA-only structure metrics of the PDB files in <eval_dir>/pdbs
+            (bond lengths, clashes, compactness, secondary structure,
+            diversity). No external tools needed. Writes metrics.json.
+  eval      Self-consistency evaluation (scTM, scRMSD, pLDDT) with
+            ProteinMPNN (CA-only) + ESMFold. Needs a ProteinMPNN checkout
+            (--proteinmpnn_dir or PROTEINMPNN_DIR) and the transformers
+            package. Writes info.csv and summary.json.
+  all       generate, metrics and eval in sequence.
 
-  Step 2 - Run scTM pipeline (Proteus env):
-    CUDA_VISIBLE_DEVICES=1 conda run -n Proteus python evaluate.py --mode eval \
-        --eval_dir ../eval_output
+Usage:
+    python scripts/evaluate.py --mode generate --checkpoint checkpoints/best_model.pt \
+        --n_samples 100 --length 100 --eval_dir eval_output
+    python scripts/evaluate.py --mode metrics --eval_dir eval_output \
+        --reference_dir Distilled_trainset
+    python scripts/evaluate.py --mode eval --eval_dir eval_output \
+        --proteinmpnn_dir /path/to/ProteinMPNN
+
+--mode metrics and --mode eval also work on any directory of single-chain PDB
+files of your own: put them in <eval_dir>/pdbs.
 """
 
-import os
-import sys
-import json
 import argparse
-import numpy as np
+import json
+import sys
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-def reconstruct_full_backbone(ca_coords):
-    """Reconstruct N, CA, C, O from CA-only coordinates using ideal geometry.
-
-    Args:
-        ca_coords: (L, 3) numpy array of CA positions
-    Returns:
-        atoms: list of (atom_name, x, y, z) for each residue (N, CA, C, O)
-    """
-    L = len(ca_coords)
-    atoms = []
-
-    # Ideal bond lengths (Angstroms)
-    d_n_ca = 1.458
-    d_ca_c = 1.523
-    d_c_o = 1.231
-
-    for i in range(L):
-        ca = ca_coords[i]
-
-        # Determine local frame from neighboring CAs
-        if i == 0:
-            fwd = ca_coords[1] - ca
-        elif i == L - 1:
-            fwd = ca - ca_coords[i - 1]
-        else:
-            fwd = ca_coords[i + 1] - ca_coords[i - 1]
-        fwd = fwd / (np.linalg.norm(fwd) + 1e-8)
-
-        # Get a perpendicular direction
-        if i == 0:
-            ref = ca_coords[min(2, L-1)] - ca
-        elif i == L - 1:
-            ref = ca - ca_coords[max(0, i-2)]
-        else:
-            ref = ca_coords[i+1] - 2*ca + ca_coords[i-1]
-
-        perp = ref - np.dot(ref, fwd) * fwd
-        norm_perp = np.linalg.norm(perp)
-        if norm_perp < 1e-8:
-            # Fallback: arbitrary perpendicular
-            perp = np.array([1.0, 0.0, 0.0])
-            perp = perp - np.dot(perp, fwd) * fwd
-            norm_perp = np.linalg.norm(perp)
-            if norm_perp < 1e-8:
-                perp = np.array([0.0, 1.0, 0.0])
-                perp = perp - np.dot(perp, fwd) * fwd
-                norm_perp = np.linalg.norm(perp)
-        perp = perp / (norm_perp + 1e-8)
-
-        # Place N (before CA along backbone)
-        n_pos = ca - d_n_ca * (0.87 * fwd + 0.50 * perp)
-        # Place C (after CA along backbone)
-        c_pos = ca + d_ca_c * (0.87 * fwd - 0.50 * perp)
-        # Place O (off C, perpendicular to CA-C bond)
-        co_dir = np.cross(fwd, perp)
-        co_dir = co_dir / (np.linalg.norm(co_dir) + 1e-8)
-        o_pos = c_pos + d_c_o * (0.50 * co_dir + 0.87 * (c_pos - ca) / (np.linalg.norm(c_pos - ca) + 1e-8))
-
-        atoms.append(('N', n_pos))
-        atoms.append(('CA', ca))
-        atoms.append(('C', c_pos))
-        atoms.append(('O', o_pos))
-
-    return atoms
+from src.data import read_ca_coords, write_backbone_pdb
+from src.metrics import pairwise_diversity, structure_metrics
+from src.model_io import load_checkpoint
 
 
-def write_backbone_pdb(ca_coords, path, chain='A'):
-    """Write full backbone PDB (N, CA, C, O) from CA coordinates.
-
-    Places N, C, O using ideal bond geometry relative to the CA trace,
-    preserving the original CA positions exactly.
-
-    Args:
-        ca_coords: (L, 3) numpy array of CA positions
-        path: output PDB path
-    """
-    L = len(ca_coords)
-
-    # Ideal bond lengths
-    d_n_ca = 1.458
-    d_ca_c = 1.523
-    d_c_o = 1.231
-
-    # Build local frames from CA trace
-    backbone = []  # list of (N, CA, C, O) positions
-
-    for i in range(L):
-        ca = ca_coords[i]
-
-        # Forward direction along chain
-        if i == 0:
-            fwd = ca_coords[1] - ca
-        elif i == L - 1:
-            fwd = ca - ca_coords[i-1]
-        else:
-            fwd = ca_coords[i+1] - ca_coords[i-1]
-        fwd_norm = np.linalg.norm(fwd)
-        if fwd_norm < 1e-8:
-            fwd = np.array([1.0, 0.0, 0.0])
-        else:
-            fwd = fwd / fwd_norm
-
-        # Curvature direction (for placing N/C on alternating sides)
-        if 0 < i < L - 1:
-            curve = ca_coords[i+1] - 2*ca + ca_coords[i-1]
-        elif i == 0 and L > 2:
-            curve = ca_coords[2] - 2*ca_coords[1] + ca
-        else:
-            curve = np.array([0.0, 1.0, 0.0])
-
-        # Make perpendicular to fwd
-        curve = curve - np.dot(curve, fwd) * fwd
-        cn = np.linalg.norm(curve)
-        if cn < 1e-8:
-            # Find any perpendicular
-            if abs(fwd[0]) < 0.9:
-                curve = np.cross(fwd, [1, 0, 0])
-            else:
-                curve = np.cross(fwd, [0, 1, 0])
-            cn = np.linalg.norm(curve)
-        curve = curve / cn
-
-        # Third axis
-        binorm = np.cross(fwd, curve)
-
-        # Place N before CA, C after CA (tetrahedral-like angles)
-        # N-CA-C angle ~111 degrees
-        n_pos = ca - d_n_ca * (0.82 * fwd + 0.57 * curve)
-        c_pos = ca + d_ca_c * (0.82 * fwd - 0.57 * curve)
-
-        # O placement: ~120 deg from CA-C-O, in the plane
-        c_ca = ca - c_pos
-        c_ca = c_ca / (np.linalg.norm(c_ca) + 1e-8)
-        o_dir = -0.5 * c_ca + 0.866 * binorm
-        o_pos = c_pos + d_c_o * o_dir
-
-        backbone.append((n_pos, ca, c_pos, o_pos))
-
-    with open(path, 'w') as f:
-        f.write("REMARK  Generated with PI-Mamba, full backbone reconstructed\n")
-        atom_idx = 1
-        for i, (n, ca, c, o) in enumerate(backbone):
-            for name, pos, elem in [('N', n, 'N'), ('CA', ca, 'C'),
-                                     ('C', c, 'C'), ('O', o, 'O')]:
-                f.write(
-                    f"ATOM  {atom_idx:5d}  {name:<3s} ALA {chain}{i+1:4d}    "
-                    f"{pos[0]:8.3f}{pos[1]:8.3f}{pos[2]:8.3f}"
-                    f"  1.00  0.00           {elem}  \n"
-                )
-                atom_idx += 1
-        f.write("END\n")
+def pdb_files(eval_dir: str):
+    files = sorted((Path(eval_dir) / "pdbs").glob("*.pdb"))
+    if not files:
+        raise FileNotFoundError(f"No PDB files in {Path(eval_dir) / 'pdbs'}")
+    return files
 
 
 def generate_samples(args):
-    """Generate protein backbone samples using PI-Mamba."""
-    sys.path.append(str(Path(__file__).parent.parent / "src"))
-    from backbone_pi_mamba import PIMambaBackbone
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Load model
-    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    state_dict = ckpt.get('model_state_dict', ckpt)
-    d_model = ckpt.get('d_model', 256)
-    n_layers = ckpt.get('n_layers', 8)
-
-    model = PIMambaBackbone(
-        d_model=d_model, n_layers=n_layers,
-        d_state=64, n_groups=8, n_structure_layers=4,
-        max_length=2048, use_physics=True,
-    ).to(device)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    print(f"Loaded model: d_model={d_model}, n_layers={n_layers}, "
+    """Generate protein backbone samples using a trained model."""
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    model, ckpt = load_checkpoint(args.checkpoint, device=device, use_ema=not args.no_ema)
+    config = ckpt["config"]
+    print(f"Loaded {config.get('model', 'pi_mamba')}: d_model={config.get('d_model')}, "
+          f"n_layers={config.get('n_layers')}, "
           f"params={sum(p.numel() for p in model.parameters()):,}")
 
-    # Generate
-    pdb_dir = os.path.join(args.eval_dir, 'pdbs')
-    os.makedirs(pdb_dir, exist_ok=True)
+    pdb_dir = Path(args.eval_dir) / "pdbs"
+    pdb_dir.mkdir(parents=True, exist_ok=True)
+    generator = torch.Generator(device=device).manual_seed(args.seed)
 
-    batch_size = min(args.n_samples, 10)
-    n_batches = (args.n_samples + batch_size - 1) // batch_size
-    sample_idx = 0
-
-    for b in range(n_batches):
-        n = min(batch_size, args.n_samples - sample_idx)
-        print(f"Generating batch {b+1}/{n_batches} ({n} samples, L={args.length})...")
-        with torch.no_grad():
+    total = 0
+    for length in (int(v) for v in str(args.length).split(",")):
+        done = 0
+        while done < args.n_samples:
+            n = min(args.batch_size, args.n_samples - done)
+            print(f"Generating samples {done}..{done + n - 1} (L={length})...", flush=True)
             coords = model.sample(
-                length=args.length, n_samples=n,
-                n_steps=args.n_steps, device=device,
-            )
-        coords_np = coords.cpu().numpy()
-        for i in range(n):
-            pdb_path = os.path.join(pdb_dir, f'sample_{sample_idx:04d}.pdb')
-            write_backbone_pdb(coords_np[i], pdb_path)
-            sample_idx += 1
+                length=length, n_samples=n, n_steps=args.n_steps, device=device,
+                project=not args.no_projection, relax=not args.no_relax,
+                generator=generator,
+            ).cpu()
+            for ca in coords:
+                write_backbone_pdb(ca, pdb_dir / f"sample_L{length}_{done:04d}.pdb")
+                done += 1
+        total += done
 
-    print(f"Generated {sample_idx} samples in {pdb_dir}")
+    print(f"Generated {total} samples in {pdb_dir}")
+
+
+def _metrics_by_length(coords_by_length: dict) -> dict:
+    out = {}
+    for length in sorted(coords_by_length):
+        ca = torch.stack(coords_by_length[length])
+        out[f"L{length}"] = {
+            "n": len(ca),
+            **structure_metrics(ca),
+            "pairwise_tm": pairwise_diversity(ca),
+        }
+    return out
+
+
+def run_structure_metrics(args):
+    """CA-only structure metrics of the generated PDB files."""
+    by_length = defaultdict(list)
+    for path in pdb_files(args.eval_dir):
+        ca = torch.from_numpy(read_ca_coords(path))
+        by_length[len(ca)].append(ca)
+    result = {"samples": _metrics_by_length(by_length)}
+
+    if args.reference_dir:
+        ref_by_length = defaultdict(list)
+        for path in sorted(Path(args.reference_dir).glob("*.pdb")):
+            ca = read_ca_coords(path)
+            if len(ca) in by_length and len(ref_by_length[len(ca)]) < args.max_reference:
+                ref_by_length[len(ca)].append(torch.from_numpy(ca))
+        result["reference"] = _metrics_by_length(ref_by_length)
+
+    for group, table in result.items():
+        for length, m in table.items():
+            print(f"[{group} {length}, n={m['n']}] "
+                  + ", ".join(f"{k}={v:.3f}" for k, v in m.items() if k != "n"))
+
+    out_path = Path(args.eval_dir) / "metrics.json"
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Metrics saved to {out_path}")
 
 
 def run_sctm_pipeline(args):
-    """Run ProteinMPNN + ESMFold + TMscore evaluation pipeline."""
-    PIPELINE_ROOT = '/data2/2026_RNAAI/baselines/insilico_design_pipeline'
-    sys.path.insert(0, PIPELINE_ROOT)
-    orig_dir = os.getcwd()
-    os.chdir(PIPELINE_ROOT)
+    """Run the ProteinMPNN + ESMFold + TM-score evaluation pipeline."""
+    from src.designability import SelfConsistencyEvaluator, write_results
 
-    # Set ESMFold cache
-    os.environ['TORCH_HOME'] = '/data2/2026_RNAAI/baselines/Proteus/.cache/torch'
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    evaluator = SelfConsistencyEvaluator(
+        proteinmpnn_dir=args.proteinmpnn_dir, esmfold_model=args.esmfold_model,
+        n_seqs=args.n_seqs, temperature=args.sampling_temperature, device=device,
+    )
+    files = [str(p) for p in pdb_files(args.eval_dir)]
+    print(f"Evaluating {len(files)} backbones from {args.eval_dir}...")
+    records = evaluator.evaluate(files, seed=args.seed, verbose=True)
+    summary = write_results(records, args.eval_dir)
 
-    from pipeline.models.inverse_folds.proteinmpnn import ProteinMPNN
-    from pipeline.models.folds.esmfold import ESMFold
-    from pipeline.standard.unconditional import UnconditionalPipeline
-
-    device = f'cuda:0'
-
-    print("Loading ProteinMPNN (CA model)...")
-    inverse_fold_model = ProteinMPNN(device=device, num_samples=8, sampling_temperature=0.1)
-
-    print("Loading ESMFold...")
-    fold_model = ESMFold(device=device)
-
-    print("Building pipeline...")
-    pipeline = UnconditionalPipeline(inverse_fold_model, fold_model)
-
-    # Clean up any previous intermediate dirs to avoid assert errors
-    rootdir = args.eval_dir
-    for subdir in ['sequences', 'structures', 'scores', 'results', 'designs']:
-        d = os.path.join(rootdir, subdir)
-        if os.path.exists(d):
-            import shutil
-            shutil.rmtree(d)
-
-    print(f"Evaluating {rootdir}...")
-    pipeline.evaluate(rootdir, clean=False, verbose=True)
-
-    # Parse results
-    info_csv = os.path.join(rootdir, 'info.csv')
-    if os.path.exists(info_csv):
-        import pandas as pd
-        df = pd.read_csv(info_csv)
-        print("\n" + "=" * 60)
-        print("EVALUATION RESULTS")
-        print("=" * 60)
-        print(f"N samples:     {len(df)}")
-        print(f"scTM mean:     {df['scTM'].mean():.4f} ± {df['scTM'].std():.4f}")
-        print(f"scTM median:   {df['scTM'].median():.4f}")
-        if 'scRMSD' in df.columns:
-            print(f"scRMSD mean:   {df['scRMSD'].mean():.4f}")
-        if 'pLDDT' in df.columns:
-            print(f"pLDDT mean:    {df['pLDDT'].mean():.4f}")
-            designable = df[(df['scRMSD'] <= 2.0) & (df['pLDDT'] >= 70)]
-            print(f"Designability: {len(designable)/len(df):.3f} ({len(designable)}/{len(df)})")
-        print("=" * 60)
-
-        # Save summary
-        summary = {
-            'n_samples': len(df),
-            'scTM_mean': float(df['scTM'].mean()),
-            'scTM_std': float(df['scTM'].std()),
-            'scTM_median': float(df['scTM'].median()),
-        }
-        if 'scRMSD' in df.columns:
-            summary['scRMSD_mean'] = float(df['scRMSD'].mean())
-        if 'pLDDT' in df.columns:
-            summary['pLDDT_mean'] = float(df['pLDDT'].mean())
-            summary['designability'] = float(len(designable) / len(df))
-
-        with open(os.path.join(rootdir, 'summary.json'), 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"Summary saved to {rootdir}/summary.json")
-    else:
-        print(f"WARNING: {info_csv} not found. Pipeline may have failed.")
-
-    os.chdir(orig_dir)
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60)
+    print(f"N samples:          {summary['n_samples']}")
+    print(f"scTM mean:          {summary['scTM_mean']:.4f} ± {summary['scTM_std']:.4f}")
+    print(f"scTM median:        {summary['scTM_median']:.4f}")
+    print(f"scRMSD mean:        {summary['scRMSD_mean']:.4f}")
+    print(f"pLDDT mean:         {summary['pLDDT_mean']:.2f}")
+    print(f"scTM > 0.5:         {summary['frac_scTM_above_0.5']:.3f}")
+    print(f"scRMSD < 2 A:       {summary['frac_scRMSD_below_2']:.3f}")
+    print("=" * 60)
+    print(f"Per-sample results: {Path(args.eval_dir) / 'info.csv'}")
+    print(f"Summary:            {Path(args.eval_dir) / 'summary.json'}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PI-Mamba Evaluation")
-    parser.add_argument('--mode', choices=['generate', 'eval', 'both'], default='both')
-    parser.add_argument('--checkpoint', type=str, default='../checkpoints_v13/best_model.pt')
-    parser.add_argument('--eval_dir', type=str, default='../eval_output')
-    parser.add_argument('--n_samples', type=int, default=100)
-    parser.add_argument('--length', type=int, default=100)
-    parser.add_argument('--n_steps', type=int, default=200)
+    parser.add_argument('--mode', choices=['generate', 'metrics', 'eval', 'all'], default='all')
+    parser.add_argument('--eval_dir', type=str, default='eval_output')
+    parser.add_argument('--device', type=str, default=None)
+    parser.add_argument('--seed', type=int, default=0)
+
+    g = parser.add_argument_group('generate')
+    g.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pt')
+    g.add_argument('--n_samples', type=int, default=100)
+    g.add_argument('--length', type=str, default='100',
+                   help='sequence length, or a comma-separated list; n_samples per length')
+    g.add_argument('--n_steps', type=int, default=200)
+    g.add_argument('--batch_size', type=int, default=10)
+    g.add_argument('--no_ema', action='store_true', help='use the raw weights instead of the EMA weights')
+    g.add_argument('--no_projection', action='store_true', help='skip the CA-CA bond projection')
+    g.add_argument('--no_relax', action='store_true',
+                   help='project bond lengths only, without resolving clashes (relax_chain)')
+
+    g = parser.add_argument_group('metrics')
+    g.add_argument('--reference_dir', type=str, default=None,
+                   help='directory of reference PDB files to report the same metrics for')
+    g.add_argument('--max_reference', type=int, default=500)
+
+    g = parser.add_argument_group('eval')
+    g.add_argument('--proteinmpnn_dir', type=str, default=None,
+                   help='ProteinMPNN checkout (default: $PROTEINMPNN_DIR)')
+    g.add_argument('--esmfold_model', type=str, default='facebook/esmfold_v1')
+    g.add_argument('--n_seqs', type=int, default=8)
+    g.add_argument('--sampling_temperature', type=float, default=0.1)
     args = parser.parse_args()
 
-    if args.mode in ('generate', 'both'):
+    if args.mode in ('generate', 'all'):
         generate_samples(args)
-    if args.mode in ('eval', 'both'):
+    if args.mode in ('metrics', 'all'):
+        run_structure_metrics(args)
+    if args.mode in ('eval', 'all'):
         run_sctm_pipeline(args)

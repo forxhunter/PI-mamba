@@ -5,194 +5,84 @@ Length Sweep for P4 Validation
 Tests whether the Rouse advantage grows with sequence length L.
 Prediction: PI-Mamba advantage over Learned-A baseline increases with L.
 
+For every length in the sweep, a Rouse model and a Learned-A model are
+trained on the chains of exactly that length and compared on held-out chains
+of the same length. The advantage is the difference in validation
+flow-matching loss (Learned-A minus Rouse; positive means Rouse is better).
+
 Usage:
-    python run_length_sweep.py --output length_sweep.json
+    python scripts/run_length_sweep.py --lengths 100,150,200,250,300 --seeds 0,1,2
+
+Options that this script does not know are forwarded to scripts/train.py.
 """
 
-import os
-import sys
-import json
 import argparse
-import logging
+import json
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import AdamW
 import numpy as np
 
-sys.path.append(str(Path(__file__).parent.parent / "src"))
-
-from backbone_pi_mamba import PIMambaBackbone
-from measure_mode_concentration import compute_mode_concentration
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-
-class HiddenStateCapture:
-    """Captures hidden states from a layer using a forward hook."""
-    def __init__(self):
-        self.hidden = None
-        self.hook_handle = None
-        
-    def hook_fn(self, module, input, output):
-        if isinstance(output, tuple):
-            self.hidden = output[0].detach()
-        else:
-            self.hidden = output.detach()
-    
-    def register(self, module):
-        self.hook_handle = module.register_forward_hook(self.hook_fn)
-        
-    def remove(self):
-        if self.hook_handle:
-            self.hook_handle.remove()
-            
-    def get(self):
-        return self.hidden
-
-
-def train_at_length(length: int, use_physics: bool, steps: int = 50, seed: int = 0) -> dict:
-    """Train PI-Mamba at a given sequence length."""
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    physics_str = "Rouse" if use_physics else "Learned"
-    logger.info(f"Training L={length}, init={physics_str} on {device}")
-    
-    # Initialize model with physics or learned A
-    model = PIMambaBackbone(
-        d_model=256, 
-        n_layers=6, 
-        d_state=64, 
-        use_physics=use_physics
-    ).to(device)
-    
-    # Hook to capture hidden states
-    capture = HiddenStateCapture()
-    capture.register(model.pi_mamba_layers[-1])
-    
-    optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
-    
-    ck_history = []
-    loss_history = []
-    
-    model.train()
-    B = max(1, 512 // length)  # Adjust batch size for memory
-    
-    for step in range(steps):
-        coords = torch.randn(B, length, 3, device=device)
-        t = torch.rand(B, device=device)
-        
-        output = model(coords, t)
-        velocity_pred = output[0] if isinstance(output, tuple) else output
-        target = -coords
-        loss = F.mse_loss(velocity_pred, target)
-        
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        if step % 10 == 0:
-            with torch.no_grad():
-                hidden = capture.get()
-                if hidden is not None and len(hidden.shape) == 3:
-                    ck_result = compute_mode_concentration(hidden, k=10)
-                    ck_val = ck_result["C_k"]
-                else:
-                    ck_val = 0.0
-                ck_history.append({"step": step, "C_10": ck_val, "loss": loss.item()})
-            
-        loss_history.append(loss.item())
-    
-    # Final evaluation
-    model.eval()
-    with torch.no_grad():
-        coords = torch.randn(B, length, 3, device=device)
-        t = torch.zeros(B, device=device)
-        output = model(coords, t)
-        
-        hidden = capture.get()
-        final_ck = compute_mode_concentration(hidden, k=10)["C_k"] if hidden is not None else 0.0
-        final_sctm = min(0.99, 0.5 + 0.5 * (1 - min(loss_history[-1], 1.0)))
-    
-    capture.remove()
-    
-    return {
-        "length": length,
-        "use_physics": use_physics,
-        "init_type": physics_str,
-        "seed": seed,
-        "final_C_10": final_ck,
-        "final_loss": loss_history[-1],
-        "final_scTM": final_sctm,
-        "history": ck_history,
-    }
+from sweep_utils import (
+    add_common_args, attach_sctm, base_overrides, fmt, mean_std, parse_args, run_training,
+    welch_p_value,
+)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--output", type=str, default="length_sweep.json")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-    
-    # Length bins: short, medium, long
-    lengths = [50, 100, 200, 500]
-    
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--lengths", type=str, default="100,150,200,250,300",
+                        help="chain lengths to sweep (each needs enough chains in the data set)")
+    add_common_args(parser, output_dir="sweep_results/length")
+    args = parse_args(parser)
+    lengths = [int(v) for v in args.lengths.split(",")]
+
     all_results = []
-    
     for L in lengths:
-        for use_physics in [True, False]:
-            try:
-                result = train_at_length(L, use_physics, steps=args.steps, seed=args.seed)
-                all_results.append(result)
-                
-                # Save incrementally
-                with open(args.output, 'w') as f:
+        for use_physics, name in ((True, "rouse"), (False, "learned")):
+            for seed in args.seeds:
+                summary = run_training(
+                    f"L{L}_{name}_seed{seed}", args.output_dir,
+                    {**base_overrides(args), "use_physics": use_physics, "min_len": L, "max_len": L,
+                     "sample_lengths": L, "seed": seed, "log_ck": True},
+                    args.train_args, args.force,
+                )
+                summary.update(length=L, init_type=name)
+                all_results.append(attach_sctm(summary, args, args.output_dir))
+                with open(Path(args.output_dir) / "length_sweep.json", "w") as f:
                     json.dump(all_results, f, indent=2)
-                    
-            except Exception as e:
-                logger.error(f"Failed L={L} physics={use_physics}: {e}")
-                import traceback
-                traceback.print_exc()
-    
-    # Compute advantage at each length
-    print("\n" + "="*70)
-    print("P4 VALIDATION: LENGTH-DEPENDENT ROUSE ADVANTAGE")
-    print("="*70)
-    print(f"{'Length':<10} {'Rouse C_10':<15} {'Learned C_10':<15} {'Advantage':<15}")
-    print("-"*70)
-    
+
+    print("\n" + "=" * 86)
+    print("P4 VALIDATION: LENGTH-DEPENDENT ROUSE ADVANTAGE (validation flow-matching loss)")
+    print("=" * 86)
+    print(f"{'Length':<10}{'Rouse':<14}{'Learned-A':<14}{'Advantage':<14}{'p (Welch)':<12}"
+          f"{'Rouse C_10':<12}{'Learned C_10':<12}")
+    print("-" * 86)
+
     advantages = []
     for L in lengths:
-        rouse = next((r for r in all_results if r["length"] == L and r["use_physics"]), None)
-        learned = next((r for r in all_results if r["length"] == L and not r["use_physics"]), None)
-        
-        if rouse and learned:
-            adv = rouse["final_C_10"] - learned["final_C_10"]
-            advantages.append({"L": L, "advantage": adv})
-            print(f"{L:<10} {rouse['final_C_10']:<15.4f} {learned['final_C_10']:<15.4f} {adv:<+15.4f}")
-    
-    # Check if advantage grows with L (P4 prediction)
-    if len(advantages) >= 2:
-        # Simple linear correlation
-        Ls = [a["L"] for a in advantages]
-        advs = [a["advantage"] for a in advantages]
-        correlation = np.corrcoef(Ls, advs)[0, 1] if len(Ls) > 1 else 0
-        
-        print("-"*70)
-        print(f"Correlation(L, Advantage) = {correlation:.3f}")
-        if correlation > 0:
-            print("P4 VALIDATED: Rouse advantage increases with sequence length")
-        else:
-            print("P4 NOT SUPPORTED: Advantage does not increase with length")
-    
-    print(f"\nResults saved to: {args.output}")
+        rouse = [r for r in all_results if r["length"] == L and r["init_type"] == "rouse"]
+        learned = [r for r in all_results if r["length"] == L and r["init_type"] == "learned"]
+        loss_r = mean_std([r["final_val_loss"] for r in rouse])["mean"]
+        loss_l = mean_std([r["final_val_loss"] for r in learned])["mean"]
+        adv = loss_l - loss_r
+        p = welch_p_value([r["final_val_loss"] for r in rouse], [r["final_val_loss"] for r in learned])
+        advantages.append({"L": L, "advantage": adv, "p_value": p})
+        print(f"{L:<10}{loss_r:<14.4f}{loss_l:<14.4f}{adv:<+14.4f}{fmt(p):<12}"
+              f"{fmt(mean_std([r['final_C_10'] for r in rouse])['mean'], '.3f'):<12}"
+              f"{fmt(mean_std([r['final_C_10'] for r in learned])['mean'], '.3f'):<12}")
+
+    if len(advantages) >= 3:
+        correlation = float(np.corrcoef([a["L"] for a in advantages],
+                                        [a["advantage"] for a in advantages])[0, 1])
+        print("-" * 86)
+        print(f"Pearson correlation between L and the advantage: {correlation:.3f} "
+              f"({len(advantages)} lengths)")
+        print("A positive correlation is consistent with P4. Check the per-length p-values "
+              "before reading anything into it.")
+
+    with open(Path(args.output_dir) / "length_sweep_advantage.json", "w") as f:
+        json.dump(advantages, f, indent=2)
+    print(f"\nResults saved to: {Path(args.output_dir) / 'length_sweep.json'}")
 
 
 if __name__ == "__main__":

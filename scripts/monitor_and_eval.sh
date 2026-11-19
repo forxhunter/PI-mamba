@@ -1,33 +1,42 @@
 #!/bin/bash
-# Monitor V14 training and run eval when done
-cd /data2/2026_RNAAI/FINAL_SUBMISSION/code/scripts
+# Wait for a training run to finish, then generate samples and evaluate them.
+#
+# Usage:
+#   bash scripts/monitor_and_eval.sh <checkpoint_dir> [eval_dir]
+#
+# Environment:
+#   PROTEINMPNN_DIR  ProteinMPNN checkout; if unset, the scTM step is skipped
+#   N_SAMPLES (100), LENGTH (100), N_STEPS (200), POLL_SECONDS (600)
 
-while true; do
-    # Check if training is still running
-    if ! pgrep -f "train.py.*checkpoints_v14" > /dev/null 2>&1; then
-        echo "$(date): Training finished! Starting evaluation..."
-        
-        # Step 1: Generate samples
-        echo "$(date): Generating 100 samples at L=100..."
-        CUDA_VISIBLE_DEVICES=0 conda run -n fm python evaluate.py \
-            --mode generate \
-            --checkpoint ../checkpoints_v14/best_model.pt \
-            --n_samples 100 --length 100 --n_steps 200 \
-            --eval_dir /data2/2026_RNAAI/FINAL_SUBMISSION/code/eval_output_v14
-        
-        echo "$(date): Generation done. Starting scTM evaluation..."
-        
-        # Step 2: Run scTM pipeline
-        CUDA_VISIBLE_DEVICES=0 conda run -n Proteus python evaluate.py \
-            --mode eval \
-            --eval_dir /data2/2026_RNAAI/FINAL_SUBMISSION/code/eval_output_v14
-        
-        echo "$(date): Evaluation complete!"
-        echo "Results:"
-        cat /data2/2026_RNAAI/FINAL_SUBMISSION/code/eval_output_v14/info.csv 2>/dev/null || echo "Check eval_output_v14 for results"
-        break
-    fi
-    
+set -e
+
+CKPT_DIR="${1:?usage: monitor_and_eval.sh <checkpoint_dir> [eval_dir]}"
+EVAL_DIR="${2:-${CKPT_DIR}/eval_output}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Wait while a train.py process that writes to this checkpoint directory is alive
+while pgrep -f "train.py.*${CKPT_DIR}" > /dev/null 2>&1; do
     echo "$(date): Training still running..."
-    sleep 600  # Check every 10 minutes
+    sleep "${POLL_SECONDS:-600}"
 done
+echo "$(date): Training finished. Starting evaluation..."
+
+echo "$(date): Generating ${N_SAMPLES:-100} samples at L=${LENGTH:-100}..."
+python "${SCRIPT_DIR}/evaluate.py" --mode generate \
+    --checkpoint "${CKPT_DIR}/best_model.pt" \
+    --n_samples "${N_SAMPLES:-100}" --length "${LENGTH:-100}" --n_steps "${N_STEPS:-200}" \
+    --eval_dir "${EVAL_DIR}"
+
+echo "$(date): Computing structure metrics..."
+python "${SCRIPT_DIR}/evaluate.py" --mode metrics --eval_dir "${EVAL_DIR}"
+
+if [ -n "${PROTEINMPNN_DIR}" ]; then
+    echo "$(date): Starting scTM evaluation..."
+    python "${SCRIPT_DIR}/evaluate.py" --mode eval --eval_dir "${EVAL_DIR}"
+    echo "Results:"
+    cat "${EVAL_DIR}/summary.json"
+else
+    echo "PROTEINMPNN_DIR is not set; skipping the scTM evaluation."
+fi
+
+echo "$(date): Evaluation complete."

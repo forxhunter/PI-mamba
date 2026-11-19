@@ -1,140 +1,155 @@
-"""Benchmark motif‑scaffolding for PI‑Mamba and baselines.
+"""Benchmark motif scaffolding with PI-Mamba.
 
-The script evaluates two representative motifs:
-  1. Catalytic triad (His‑Asp‑Ser) – 9 residues.
-  2. Binder epitope – 12 residues.
-For each motif it generates scaffolds with:
-  * PI‑Mamba (in‑painting via `inpainting.scaffold_motif`).
-  * RFdiffusion (using its public `rfdiffusion` CLI – placeholder).
-  * FrameDiff (placeholder implementation).
-The script computes:
-  * `motif_rmsd` – RMSD between generated and reference motif.
-  * `scaffold_rmsd` – RMSD of the non‑motif region against a reference scaffold
-    (if available).
-  * `scTM` – designability proxy via `DesignabilityProxyLoss`.
-Results are saved to `benchmark_results.csv`.
+A motif is a set of residue ranges cut out of a real structure. For every
+motif the script generates scaffolds with ``inpainting.scaffold_motif`` and
+reports, per sample:
+
+  * ``motif_rmsd``  RMSD (Angstrom) between the motif in the generated chain
+                    and the reference motif after optimal superposition.
+  * ``clash_frac``  fraction of residues with a non-neighbour CA closer than 3 A.
+  * ``scTM``        self-consistency TM-score, only with --proteinmpnn_dir.
+  * ``success``     motif_rmsd < 1 A (and scTM > 0.5 when scTM is measured).
+
+Scaffolds made by other methods (for example RFdiffusion or FrameDiff) can
+be scored with the same metrics: pass ``--baseline NAME=DIR`` with a
+directory of PDB files named ``<motif>_*.pdb`` that contain the motif at the
+same residue positions. No baseline is run or simulated by this script.
+
+Usage (from the repository root):
+    python -m src.benchmark_scaffold --ckpt checkpoints/best_model.pt \
+        --motif helix:Distilled_trainset/sample_000000_L100_scTM0.965.pdb:10-24 \
+        --motif two_seg:Distilled_trainset/sample_000000_L100_scTM0.965.pdb:5-14,60-69 \
+        --n_samples 8 --out benchmark_results.csv
+
+A motif is written NAME:PDB:RANGES[:LENGTH]. RANGES are 1-based inclusive
+residue ranges in the source structure; the motif keeps these positions in a
+scaffold of LENGTH residues (default: the length of the source structure).
 """
 
 import argparse
 import csv
-import os
 from pathlib import Path
 
 import torch
 
-# Local imports – adjust if repository layout changes
-from inpainting import scaffold_motif
-from designability_loss import DesignabilityProxyLoss
-from backbone_pi_mamba import PIMambaBackbone
+from .data import read_ca_coords, write_backbone_pdb
+from .geometry import kabsch_rmsd
+from .inpainting import scaffold_motif
+from .metrics import clash_fraction
+from .model_io import load_checkpoint
 
-# Placeholder functions for baselines – replace with actual calls
-def run_rfdiffusion(motif_coords, motif_mask, length, n_steps=100):
-    # In a real implementation, invoke the RFdiffusion CLI or library.
-    # Here we simply return the input motif duplicated with random noise for the rest.
-    B, M, _ = motif_coords.shape
-    scaffold = torch.randn(B, length, 3) * 0.1
-    scaffold[motif_mask] = motif_coords.view(-1, 3)
-    return scaffold
 
-def run_framediff(motif_coords, motif_mask, length, n_steps=100):
-    # Placeholder similar to RFdiffusion.
-    B, M, _ = motif_coords.shape
-    scaffold = torch.randn(B, length, 3) * 0.1
-    scaffold[motif_mask] = motif_coords.view(-1, 3)
-    return scaffold
+def parse_motif(spec: str):
+    """Parse NAME:PDB:RANGES[:LENGTH] into (name, motif coords (M, 3), mask (L,))."""
+    parts = spec.split(":")
+    if len(parts) not in (3, 4):
+        raise ValueError(f"motif must be NAME:PDB:RANGES[:LENGTH], got {spec!r}")
+    name, pdb, ranges = parts[:3]
+    ca = torch.from_numpy(read_ca_coords(pdb))
+    length = int(parts[3]) if len(parts) == 4 else len(ca)
+    mask = torch.zeros(length, dtype=torch.bool)
+    for item in ranges.split(","):
+        start, end = (int(v) for v in item.split("-"))
+        if not 1 <= start <= end <= min(length, len(ca)):
+            raise ValueError(f"range {item} is outside the structure or the scaffold")
+        mask[start - 1:end] = True
+    return name, ca[mask[:len(ca)].nonzero().squeeze(-1)], mask
 
-def rmsd(a: torch.Tensor, b: torch.Tensor) -> float:
-    a_centered = a - a.mean(dim=1, keepdim=True)
-    b_centered = b - b.mean(dim=1, keepdim=True)
-    diff = a_centered - b_centered
-    return torch.sqrt((diff ** 2).sum() / a.shape[1]).item()
 
-def evaluate_method(method_name, model, motif_coords, motif_mask, length, design_loss):
-    if method_name == "PI-Mamba":
-        out = scaffold_motif(
-            model=model,
-            length=length,
-            motif_coords=motif_coords,
-            motif_mask=motif_mask,
-            n_steps=200,
-            proj_every=10,
-            device=model.device,
-        )
-        scaffold = out["scaffold"]
-        motif_rmsd = out["motif_rmsd"].item()
-    elif method_name == "RFdiffusion":
-        scaffold = run_rfdiffusion(motif_coords, motif_mask, length)
-        motif_rmsd = rmsd(scaffold[motif_mask].view(1, -1, 3), motif_coords)
-    elif method_name == "FrameDiff":
-        scaffold = run_framediff(motif_coords, motif_mask, length)
-        motif_rmsd = rmsd(scaffold[motif_mask].view(1, -1, 3), motif_coords)
-    else:
-        raise ValueError(f"Unknown method {method_name}")
+def score(scaffolds, motif, mask, evaluator, workdir: Path, prefix: str):
+    """Metrics for scaffolds (B, L, 3) that contain the motif at ``mask``."""
+    B = scaffolds.shape[0]
+    motif_rmsd = kabsch_rmsd(scaffolds[:, mask], motif.expand(B, -1, -1))
+    clashes = clash_fraction(scaffolds)
+    sc_tm = [None] * B
+    if evaluator is not None:
+        files = []
+        for i, ca in enumerate(scaffolds):
+            files.append(str(workdir / f"{prefix}_{i:03d}.pdb"))
+            write_backbone_pdb(ca, files[-1])
+        sc_tm = [r["scTM"] for r in evaluator.evaluate(files)]
+    rows = []
+    for i in range(B):
+        ok = motif_rmsd[i].item() < 1.0 and (sc_tm[i] is None or sc_tm[i] > 0.5)
+        rows.append({
+            "motif_rmsd": round(motif_rmsd[i].item(), 4),
+            "clash_frac": round(clashes[i].item(), 4),
+            "scTM": None if sc_tm[i] is None else round(sc_tm[i], 4),
+            "success": ok,
+        })
+    return rows
 
-    # Designability proxy (scTM)
-    sc_tm = 1.0 - design_loss(scaffold).item()
-    return motif_rmsd, sc_tm, scaffold
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark motif scaffolding")
-    parser.add_argument("--ckpt", type=str, required=True, help="Path to PI‑Mamba checkpoint")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--ckpt", type=str, required=True, help="Path to PI-Mamba checkpoint")
+    parser.add_argument("--motif", action="append", required=True, help="NAME:PDB:RANGES[:LENGTH] (repeatable)")
+    parser.add_argument("--baseline", action="append", default=[], help="NAME=DIR of PDB files (repeatable)")
+    parser.add_argument("--n_samples", type=int, default=8)
+    parser.add_argument("--n_steps", type=int, default=200)
+    parser.add_argument("--no_final_projection", action="store_true",
+                        help="keep the motif exact instead of making all bond lengths exactly 3.8 A")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--proteinmpnn_dir", type=str, default=None, help="also measure scTM")
     parser.add_argument("--out", type=str, default="benchmark_results.csv")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PIMambaBackbone().to(device)
-    if os.path.isfile(args.ckpt):
-        state = torch.load(args.ckpt, map_location=device)
-        model.load_state_dict(state["model_state_dict"], strict=False)
-    else:
-        print(f"[Warning] Checkpoint {args.ckpt} not found – using random init")
-
-    design_loss = DesignabilityProxyLoss(device)
-
-    # Define two motifs (coordinates and masks). In practice load from PDB files.
-    # Here we create dummy motifs for illustration.
-    motifs = []
-    # Motif 1: catalytic triad (9 residues)
-    length1 = 60
-    motif_coords1 = torch.randn(1, 9, 3) * 0.1
-    mask1 = torch.zeros(1, length1, dtype=torch.bool)
-    mask1[0, :9] = True
-    motifs.append(("Triad", length1, motif_coords1, mask1))
-    # Motif 2: binder epitope (12 residues)
-    length2 = 80
-    motif_coords2 = torch.randn(1, 12, 3) * 0.1
-    mask2 = torch.zeros(1, length2, dtype=torch.bool)
-    mask2[0, :12] = True
-    motifs.append(("Binder", length2, motif_coords2, mask2))
-
-    methods = ["PI-Mamba", "RFdiffusion", "FrameDiff"]
-    results = []
-    for name, L, coords, mask in motifs:
-        for method in methods:
-            motif_rmsd, sc_tm, _ = evaluate_method(
-                method, model, coords, mask, L, design_loss
-            )
-            results.append({
-                "motif": name,
-                "method": method,
-                "length": L,
-                "motif_rmsd": motif_rmsd,
-                "scTM": sc_tm,
-                "success": motif_rmsd < 1.0,
-            })
-            print(f"{method} on {name}: RMSD={motif_rmsd:.3f} Å, scTM={sc_tm:.3f}")
+    model, _ = load_checkpoint(args.ckpt, device=device)
 
     out_path = Path(args.out)
+    workdir = out_path.parent / (out_path.stem + "_pdbs")
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    evaluator = None
+    if args.proteinmpnn_dir:
+        from .designability import SelfConsistencyEvaluator
+        evaluator = SelfConsistencyEvaluator(proteinmpnn_dir=args.proteinmpnn_dir, device=str(device))
+
+    results = []
+    generator = torch.Generator(device=device).manual_seed(args.seed)
+    for spec in args.motif:
+        name, motif, mask = parse_motif(spec)
+        L, B = len(mask), args.n_samples
+
+        out = scaffold_motif(
+            model, L, motif.expand(B, -1, -1), mask.expand(B, -1),
+            n_steps=args.n_steps, final_projection=not args.no_final_projection,
+            device=device, generator=generator,
+        )
+        scaffolds = out["scaffold"].cpu()
+        if evaluator is None:
+            for i, ca in enumerate(scaffolds):
+                write_backbone_pdb(ca, workdir / f"{name}_pimamba_{i:03d}.pdb")
+        methods = {"PI-Mamba": score(scaffolds, motif, mask, evaluator, workdir, f"{name}_pimamba")}
+
+        for item in args.baseline:
+            method, directory = item.split("=", 1)
+            files = sorted(Path(directory).glob(f"{name}_*.pdb"))
+            coords = [torch.from_numpy(read_ca_coords(f)) for f in files]
+            coords = [c for c in coords if len(c) == L]
+            if not coords:
+                print(f"[Warning] no {name}_*.pdb of length {L} in {directory}; skipping {method}")
+                continue
+            methods[method] = score(torch.stack(coords), motif, mask, evaluator, workdir, f"{name}_{method}")
+
+        for method, rows in methods.items():
+            for i, row in enumerate(rows):
+                results.append({"motif": name, "method": method, "length": L, "sample": i, **row})
+            rmsd = sum(r["motif_rmsd"] for r in rows) / len(rows)
+            success = sum(r["success"] for r in rows) / len(rows)
+            print(f"{method} on {name} (L={L}, motif {int(mask.sum())} residues, n={len(rows)}): "
+                  f"mean motif RMSD={rmsd:.3f} A, success rate={success:.2f}")
+
     with out_path.open("w", newline="") as csvfile:
         writer = csv.DictWriter(
             csvfile,
-            fieldnames=["motif", "method", "length", "motif_rmsd", "scTM", "success"],
+            fieldnames=["motif", "method", "length", "sample", "motif_rmsd", "clash_frac", "scTM", "success"],
         )
         writer.writeheader()
         writer.writerows(results)
     print(f"Benchmark results saved to {out_path}")
 
+
 if __name__ == "__main__":
     main()
-
-# End of benchmark_scaffold.py
