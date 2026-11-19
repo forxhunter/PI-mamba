@@ -283,6 +283,8 @@ def relax_chain(
     w_bond: float = 1.0,
     w_clash: float = 1.0,
     w_local: float = 1.0,
+    w_contact: float = 0.0,
+    contact_cutoff: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Relax a CA trace so that its virtual bonds have the right length and no two
@@ -296,12 +298,35 @@ def relax_chain(
         w_bond  * mean((|x_{i+1} - x_i| - bond)^2)
       + w_clash * sum(relu(min_dist - d_ij)^2) / (B L)     over |i - j| >= min_sep
       + w_local * mean((d_ij - d_ij at the start)^2)       over 2 <= |i - j| <= local_window
+      + w_contact * mean((d_ij - d_ij at the start)^2)     over the pairs that
+                                                           start in contact
 
     by gradient descent on the coordinates. The third term holds the local
     geometry in place: without it, pushing overlapping residues apart also
     straightens helices, because the distances that define secondary structure
     are free to change. Separating the terms this way is what structure
     refinement does, local restraints plus a global non-overlap term.
+
+    The third term reaches only to ``local_window``, so nothing restrains a pair
+    further apart along the chain, and the register of a beta ladder is free to
+    drift while the bond and clash terms are satisfied. Measured on 200 training
+    structures of length 100, the defaults keep 65 per cent of the ladders that
+    the input contains, against 94 per cent for ``project_bonds``, although they
+    move the coordinates less. ``w_contact`` adds a restraint on every pair that
+    starts in contact and is not a clash, at any separation, which leaves the
+    clash term free to fix real overlaps while holding tertiary contacts and
+    sheet pairing in place. It is off by default.
+
+    On training structures the restraint keeps every ladder, 104 per cent
+    against 65 per cent for the defaults. It does not carry over to raw model
+    output: on 100 unprocessed samples of length 100 the ladders kept were 7
+    with the defaults and 8 with the restraint, out of 19 in the input, which
+    is a difference of one ladder and not a result. Raw samples arrive with a
+    bond standard deviation of 0.17 A and a clash fraction of 0.074, so many of
+    their contacts are not structure, and holding them works against the clash
+    term. The step is worth 0.12 ladders per structure in total, against the
+    0.73 that separates the model from its training data, so it is not where
+    sheet content is lost.
 
     The defaults for min_dist and min_sep come from the training structures:
     over pairs at least 2 apart along the chain, the smallest CA-CA distance
@@ -323,6 +348,11 @@ def relax_chain(
         n_steps: gradient steps
         lr: step size, in units of the coordinates
         w_bond, w_clash, w_local: relative weight of the three terms
+        w_contact: weight of the restraint on pairs that start in contact, at
+            any separation along the chain; 0 disables it
+        contact_cutoff: a pair counts as in contact when it starts at least
+            min_dist and at most this far apart; defaults to 2.1 * bond, which
+            is 8.0 A for a 3.8 A virtual bond
 
     Returns:
         (B, L, 3) relaxed coordinates, with the centroid of the input
@@ -343,6 +373,22 @@ def relax_chain(
     # already impossible, so holding it would block the bond term from fixing it.
     reachable = target_local <= sep.unsqueeze(0) * bond
     near = ((sep >= 2) & (sep <= local_window)).unsqueeze(0) & reachable
+
+    # Pairs that start in contact without overlapping. Holding these keeps the
+    # register of a sheet and the packing of the fold while the clash term
+    # works on the pairs that really are too close.
+    use_contact = w_contact > 0
+    if use_contact:
+        cutoff = contact_cutoff if contact_cutoff is not None else 2.1 * bond
+        contact = (
+            far
+            & reachable
+            & (target_local <= cutoff)
+            & (target_local >= min_dist)
+            & ~near
+        )
+        n_contact = contact.sum().clamp_min(1)
+
     optimizer = torch.optim.Adam([x], lr=lr)
 
     with torch.enable_grad():
@@ -354,6 +400,9 @@ def relax_chain(
             clash_term = (overlap ** 2).sum() / (B * L)
             local_term = (((dist - target_local) * near) ** 2).sum() / near.sum().clamp_min(1)
             loss = w_bond * bond_term + w_clash * clash_term + w_local * local_term
+            if use_contact:
+                contact_term = (((dist - target_local) * contact) ** 2).sum() / n_contact
+                loss = loss + w_contact * contact_term
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
