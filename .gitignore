@@ -28,3 +28,12 @@ sweep_results/
 counterfactual_results/
 figures/
 *.log
+
+# Stray diagnostic output written to the working directory
+sheet_quality.json
+sheet_quality.csv
+sheet_recovery.json
+relax_effect.json
+pair_dilution.json
+loss_vs_register.json
+novelty_check.json

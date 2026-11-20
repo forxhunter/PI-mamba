@@ -47,28 +47,39 @@ What it did in training
 It did not work, and the default weight is 0 for that reason.
 
 The term was run as a continuation from the 100000-step paper-config
-checkpoint at ``lambda_register 1.0`` for 25000 steps, against a continuation
+checkpoint at ``lambda_register 1.0`` to 200000 steps, against a continuation
 from the same checkpoint on the same learning-rate schedule with the term
-off. The term itself fell from 0.173 to 0.113, so it was being optimised. The
-samples did not change. From noise at length 100, 300 samples per arm:
+off. The term itself fell from 0.173 to 0.094 over those 100000 steps, so it
+was optimised throughout. Nothing else changed. From noise at length 100,
+300 samples per arm at the end of both runs:
 
                         control    with the term
-  registered_frac        0.008         0.007        (after relaxation)
-  ladders per sample     0.063         0.053
-  registered_frac        0.014         0.014        (bonds projected only)
-  ladders per sample     0.123         0.097
+  registered_frac        0.010         0.011        (after relaxation)
+  ladders per sample     0.080         0.077
+  registered_frac        0.016         0.012        (bonds projected only)
+  ladders per sample     0.150         0.103
 
-Register retention at t=0.9 fell by 0.032 (paired over 200 structures,
-standard error 0.012), and the flow-matching validation loss was 2.5 per cent
-higher, 0.4530 against 0.4418, and flat over the run rather than falling.
+Register retention at t=0.9, paired over the same 200 structures, differed by
+-0.010 with a standard error of 0.011, so neither arm is ahead. The cost is
+real and did not shrink: the flow-matching validation loss ended at 0.4478
+against the control's 0.4375, 2.4 per cent higher, the same gap it had at
+102500 steps.
 
 So the model learned to place the supervised pairs correctly when it is given
 a partly noised structure, and that did not carry over to sampling from
 noise. The dilution the term was built to fix is real, and fixing it is not
-sufficient. Anyone reusing this module should read that as evidence about the
-problem rather than about the implementation: a longer run, a different
-weight or a different ``aux_t_min`` might behave differently, but the first
-25000 steps bought nothing.
+sufficient.
+
+One number here was wrong at the halfway point and is worth recording. At
+25000 steps the register arm looked significantly worse on retention, -0.032
+with a standard error of 0.012. That was transient and had gone by the end of
+the run. A single paired comparison partway through a training run can show a
+difference that does not survive, in either direction.
+
+Anyone reusing this module should read the result as evidence about the
+problem rather than about the implementation: a different weight, a different
+``aux_t_min``, or training from scratch rather than as a continuation might
+behave differently.
 """
 
 from __future__ import annotations
