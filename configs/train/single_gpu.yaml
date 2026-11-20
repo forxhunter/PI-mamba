@@ -26,6 +26,7 @@ lambda_bond: 1.0         # CA-CA bond length loss (3.8 Angstrom)
 lambda_dist: 0.5         # long-range distance matrix loss
 lambda_rg: 0.0           # radius-of-gyration prior
 lambda_hbond: 0.0        # secondary-structure prior
+lambda_register: 0.0     # distance supervision on the beta-sheet register pairs
 lambda_rama: 0.0         # pseudo-dihedral prior
 lambda_omega: 0.0        # cis/trans head (labels from CA-CA distance)
 lambda_torsion: 0.0      # torsion head; needs N and C atoms in the PDB files

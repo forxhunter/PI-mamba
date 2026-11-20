@@ -42,12 +42,20 @@ from src.data import read_ca_coords  # noqa: E402
 from src.model_io import load_checkpoint  # noqa: E402
 
 
-def ladder_stats(coords: torch.Tensor) -> Dict[str, float]:
+def ladder_stats(coords: torch.Tensor) -> Dict[str, object]:
+    """Mean features, plus the per-structure values.
+
+    The per-structure arrays matter because two checkpoints are run on the
+    same reference structures with the same noise seed, so their retention
+    can be compared pair by pair. Comparing means alone cannot tell a real
+    difference from the counting noise of a few dozen ladders.
+    """
     feats = [sheet_features(c.cpu(), min_ladder=3) for c in coords]
-    out = {}
+    out: Dict[str, object] = {}
     for k in ("strand_frac", "registered_frac", "n_ladders"):
         v = np.array([f[k] for f in feats], dtype=float)
         out[k] = float(np.nanmean(v))
+        out[f"{k}_per_structure"] = [float(x) for x in v]
     return out
 
 

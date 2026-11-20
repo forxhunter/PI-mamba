@@ -15,7 +15,9 @@ PI-Mamba generates protein CA traces with flow matching. Its sequence encoder is
   - `backbone_performer.py`, `backbone_transformer.py`: baseline encoders with the same heads and sampler
   - `geometry.py`: NeRF, torsions, Kabsch superposition, CA-to-backbone placement
   - `data.py`: PDB reading and writing, dataset, length-bucketed batching
-  - `losses/`: auxiliary structure losses on CA coordinates
+  - `losses/`: auxiliary structure losses on CA coordinates, including
+    `register_loss.py` (beta-sheet register; off by default, and its docstring
+    records what it did and did not do in training)
   - `metrics.py`: CA-only structure metrics and TM-score
   - `designability.py`: scTM pipeline (ProteinMPNN + ESMFold)
   - `inpainting.py`, `benchmark_scaffold.py`: motif scaffolding
@@ -30,6 +32,11 @@ PI-Mamba generates protein CA traces with flow matching. Its sequence encoder is
   - `novelty_check.py`: nearest-neighbour TM-score of samples against the training set
   - `sweep_sampling.sh`, `collect_sweep.py`: sampler settings against scTM
   - `sheet_scaling.sh`: sheet formation across checkpoints
+  - `sheet_recovery.py`: whether the model keeps a sheet it is handed part way along the flow path
+  - `compare_recovery.py`, `compare_arms.sh`: paired comparison of two checkpoints' register retention
+  - `loss_vs_register.py`: per-structure flow-matching error against register retention
+  - `check_pair_dilution.py`: how much of the distance map carries a sheet, and the model's error on it
+  - `check_relax_effect.py`: what the end-of-sampling relaxation does to beta ladders
   - `run_counterfactual_experiments.py`: Counterfactual experiments (Appendix S16)
   - `run_ck_sweep.py`, `run_architecture_sweep.sh`: architecture comparison
   - `run_length_sweep.py`: Rouse vs Learned-A as a function of chain length
@@ -142,6 +149,41 @@ CA metrics and scTM and collects them into one table with
 `scripts/collect_sweep.py`. It reports secondary-structure content and sample
 diversity next to scTM, because scTM on its own rises when the output collapses
 onto helical bundles.
+
+Two more scripts work on the velocity field rather than on finished samples,
+which is a far more sensitive test of beta-sheet quality and needs neither
+ProteinMPNN nor ESMFold:
+
+```bash
+# Noise a training structure part of the way back along the flow-matching path
+# and integrate to t=1: does the model keep a sheet it is handed?
+python scripts/sheet_recovery.py --checkpoint checkpoints/run/last.pt \
+    --reference Distilled_trainset --n 200 --t0 0.9
+
+# The same measurement on two checkpoints is paired structure by structure,
+# so differences smaller than the spread between structures are visible
+python scripts/compare_recovery.py a.json b.json --key t0=0.9
+
+# Both at once for two training arms
+scripts/compare_arms.sh baseline.pt candidate.pt tag 200
+```
+
+Two scripts ask whether the loss sees the sheets at all:
+
+```bash
+# Per-structure flow-matching error against register retention
+python scripts/loss_vs_register.py --checkpoint checkpoints/run/last.pt --n 200
+
+# What fraction of the distance map carries a sheet, and whether the model is
+# worse on those pairs than on the map as a whole
+python scripts/check_pair_dilution.py --checkpoint checkpoints/run/last.pt --n 200
+```
+
+A note on reading scTM. At 100 samples the spread between seeds is larger than
+most effects worth measuring: one checkpoint gave 0.718 and 0.785 under
+identical settings. scTM also does not track sheet register, so a run with
+2.7 times the beta ladders can score lower. Quote it with its seed spread and
+read `registered_frac` beside it.
 
 ## Motif Scaffolding
 

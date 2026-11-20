@@ -45,7 +45,7 @@ from src.data import CADataset, LengthBatchSampler, collate_same_length
 from src.geometry import CA_CA_TRANS, coords_to_torsions, random_rotations
 from src.losses import (
     BondLengthLoss, DistogramLoss, HydrogenBondLoss, LocalDistanceLoss,
-    RadiusOfGyrationLoss, RamachandranLoss,
+    RadiusOfGyrationLoss, RamachandranLoss, RegisterDistanceLoss,
 )
 from src.measure_mode_concentration import compute_mode_concentration
 from src.metrics import structure_metrics
@@ -56,7 +56,8 @@ DEFAULT_CONFIGS = (
     REPO_ROOT / "configs" / "model" / "pi_mamba_v12.yaml",
     REPO_ROOT / "configs" / "train" / "single_gpu.yaml",
 )
-LOSS_TERMS = ("fape", "bond", "dist", "rg", "hbond", "rama", "omega", "torsion")
+LOSS_TERMS = ("fape", "bond", "dist", "rg", "hbond", "rama", "omega", "torsion",
+               "register")
 
 
 # ----------------------------------------------------------------------------
@@ -199,6 +200,11 @@ class AuxiliaryLosses:
         self.rg = RadiusOfGyrationLoss()
         self.hbond = HydrogenBondLoss()
         self.rama = RamachandranLoss()
+        # Distance supervision restricted to the pairs that carry a beta sheet.
+        # The whole-map term above spreads its weight over every pair, and the
+        # register pairs are 0.10 per cent of them; see
+        # scripts/check_pair_dilution.py.
+        self.register = RegisterDistanceLoss(weight=1.0, local_weight=1.0)
 
     @property
     def needs_hidden(self) -> bool:
@@ -234,6 +240,8 @@ class AuxiliaryLosses:
             losses["hbond"] = self.hbond(x1_hat)
         if w["rama"] > 0:
             losses["rama"] = self.rama(x1_hat)
+        if w["register"] > 0:
+            losses["register"] = self.register(x1_hat, target) / scale
         if w["omega"] > 0:
             # Label 1 (cis) where the CA-CA distance to the previous residue is short
             d = (target[:, 1:] - target[:, :-1]).norm(dim=-1)

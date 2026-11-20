@@ -4,6 +4,11 @@ from .distogram_loss import DistogramLoss, RadiusOfGyrationLoss
 from .fape_loss import BondLengthLoss, LocalDistanceLoss
 from .hbond_loss import HydrogenBondLoss
 from .ramachandran_loss import RamachandranLoss
+from .register_loss import (
+    RegisterDistanceLoss,
+    RegisterLoss,
+    soft_register_score,
+)
 
 __all__ = [
     "DistogramLoss",
@@ -12,4 +17,7 @@ __all__ = [
     "LocalDistanceLoss",
     "HydrogenBondLoss",
     "RamachandranLoss",
+    "RegisterDistanceLoss",
+    "RegisterLoss",
+    "soft_register_score",
 ]
