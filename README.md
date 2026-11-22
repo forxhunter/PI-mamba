@@ -34,6 +34,7 @@ PI-Mamba generates protein CA traces with flow matching. Its sequence encoder is
   - `sheet_scaling.sh`: sheet formation across checkpoints
   - `sheet_recovery.py`: whether the model keeps a sheet it is handed part way along the flow path
   - `compare_recovery.py`, `compare_arms.sh`: paired comparison of two checkpoints' register retention
+  - `compare_trajectories.py`: two runs' validation statistics lined up by step
   - `loss_vs_register.py`: per-structure flow-matching error against register retention
   - `check_pair_dilution.py`: how much of the distance map carries a sheet, and the model's error on it
   - `check_relax_effect.py`: what the end-of-sampling relaxation does to beta ladders
@@ -178,6 +179,23 @@ python scripts/loss_vs_register.py --checkpoint checkpoints/run/last.pt --n 200
 # worse on those pairs than on the map as a whole
 python scripts/check_pair_dilution.py --checkpoint checkpoints/run/last.pt --n 200
 ```
+
+Two training arms can also be read against each other while they run, from the
+secondary-structure statistics that each validation step already logs:
+
+```bash
+python scripts/compare_trajectories.py \
+    --log control=checkpoints/paper_512x16/train_log.jsonl \
+    --log arm=checkpoints/arm/train_log.jsonl \
+    --field samples.L100.strand_frac --field val_loss --every 10000 --window 5
+```
+
+Read a trajectory, not a point. An earlier pair of ablation arms was compared at
+20000 steps, where neither had produced a beta ladder yet, so both read zero and
+the comparison carried no information. Ladders appear between 20000 and 100000
+steps. Each validation record samples 16 structures per length, so `--window`
+averages several records; a single reading of `strand_frac` moves by more than
+the effects worth measuring.
 
 A note on reading scTM. At 100 samples the spread between seeds is larger than
 most effects worth measuring: one checkpoint gave 0.718 and 0.785 under
