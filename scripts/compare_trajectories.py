@@ -13,16 +13,19 @@ both read zero and the comparison carried no information. Ladders appear
 somewhere between 20000 and 100000 steps, so an arm has to be followed.
 
 Each validation record samples 16 structures per length, so a single
-``strand_frac`` reading is noisy. ``--window`` averages over the last k
-validation records at or before each reported step, which is what makes a
-difference of a few percent legible.
+``strand_frac`` reading has a standard error of about 0.03 and nothing below a
+large difference is visible in it. ``--window`` averages the records within a
+span of steps, which is what makes a difference of a few percent legible. The
+window is counted in steps rather than in records so that two runs validating
+at different intervals average over the same span of training; see
+``windowed``.
 
 Usage:
     python scripts/compare_trajectories.py \
         --log control=checkpoints/paper_512x16/train_log.jsonl \
         --log scrambled=checkpoints/arm_scrambled_512x16/train_log.jsonl \
         --field samples.L100.strand_frac --field val_loss \
-        --every 10000 --window 5
+        --every 10000 --window 10000
 """
 
 from __future__ import annotations
@@ -44,9 +47,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "samples.L100.strand_frac (repeatable)")
     p.add_argument("--every", type=int, default=10000,
                    help="report at multiples of this many steps (default 10000)")
-    p.add_argument("--window", type=int, default=1,
-                   help="average over the last k val records up to each reported "
-                        "step (default 1, no averaging)")
+    p.add_argument("--window", type=int, default=0,
+                   help="average over the val records of the last N STEPS up to "
+                        "each reported step (default 0: the single record at "
+                        "that step). Counted in steps, not records, so two runs "
+                        "that validate at different intervals still average over "
+                        "the same span of training")
     p.add_argument("--last", action="store_true",
                    help="also report each run's most recent val record, even if "
                         "it is not a multiple of --every")
@@ -95,7 +101,17 @@ def read_val_records(path: Path) -> List[dict]:
 
 def windowed(records: Sequence[dict], step: int, field: str,
              window: int) -> Tuple[Optional[float], int]:
-    """Mean of ``field`` over the last ``window`` val records up to ``step``.
+    """Mean of ``field`` over the val records in ``(step - window, step]``.
+
+    The window is a span of training steps, not a count of records. Two runs
+    that validate at different intervals then average over the same span, which
+    they do not if the window counts records: with one run validating every
+    1000 steps and another every 2500, five records reach back 5000 steps in
+    the first and 12500 in the second. On a curve that is still moving, the run
+    with the longer reach is pulled toward its own past, and the difference
+    between the two runs picks up that bias rather than a difference between
+    the models. The bias is not small: on the beta-strand fraction, which rises
+    through training, it was about a third of the apparent gap between two arms.
 
     A run that has not reached ``step`` reports nothing rather than its last
     value, so that a shorter run does not appear as a flat line next to a
@@ -103,12 +119,17 @@ def windowed(records: Sequence[dict], step: int, field: str,
     """
     if not records or records[-1]["step"] < step:
         return None, 0
-    vals = [v for r in records if r["step"] <= step
+    lo = step - max(window, 0)
+    vals = [v for r in records if lo <= r["step"] <= step
             for v in [dig(r, field)] if v is not None]
     if not vals:
+        # No record inside the window: fall back to the newest one at or
+        # before ``step``, so a coarse validation interval still reports.
+        vals = [v for r in records if r["step"] <= step
+                for v in [dig(r, field)] if v is not None][-1:]
+    if not vals:
         return None, 0
-    take = vals[-max(window, 1):]
-    return sum(take) / len(take), len(take)
+    return sum(vals) / len(vals), len(vals)
 
 
 def fmt(value: Optional[float]) -> str:
@@ -135,7 +156,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.last:
         steps = sorted(set(steps) | set(last_steps.values()))
 
-    print(f"window {args.window} val record(s); {len(runs)} run(s)")
+    span = f"last {args.window} steps" if args.window else "single record"
+    print(f"window: {span}; {len(runs)} run(s)")
     for name, recs in runs:
         print(f"  {name:<14} {len(recs):>4} val records, last step {last_steps[name]}")
     base_name = runs[0][0]
